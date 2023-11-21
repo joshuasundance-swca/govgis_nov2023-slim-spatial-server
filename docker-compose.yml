@@ -58,7 +58,7 @@ services:
     networks:
       - govgis_nov2023-slim-spatial-server
     ports:
-      - "${PGADMIN_PORT:-8080}:8080"
+      - "${PGADMIN_PORT:-80}:80"
 
 
 volumes:
