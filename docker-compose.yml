@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: joshuasundance/postgis_pgvector:1.0.0
+    container_name: postgres
+    env_file:
+      - .env
+    volumes:
+      - govgis_nov2023-slim-spatial-server_pgdata:/var/lib/postgresql/data
+    networks:
+      - govgis_nov2023-slim-spatial-server
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+    ports:
+      - "5432:5432"
+
+  postgres-init:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/home/appuser/backend
+      - ./govgis-nov2023/:/home/appuser/postgres-init
+    networks:
+      - govgis_nov2023-slim-spatial-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    working_dir: /home/appuser/backend
+    command: ["python", "load_data.py"]
+
+#  backend:
+#    build: .
+#    env_file:
+#      - .env
+#    volumes:
+#      - ./backend/backend:/home/appuser/backend
+#    networks:
+#      - govgis_nov2023-slim-spatial-server
+#    ports:
+#      - "${BACKEND_PORT:-8080}:8080"
+#    depends_on:
+#      postgres:
+#        condition: service_healthy
+#      postgres-init:
+#        condition: service_completed_successfully
+#    working_dir: /home/appuser/backend
+#    command: ["gunicorn", "app:app"]
+
+  pgadmin:
+    image: dpage/pgadmin4:7.8
+    container_name: pgadmin
+    env_file:
+      - .env
+    volumes:
+      - govgis_nov2023-slim-spatial-server_pgadmin_data:/var/lib/pgadmin
+    networks:
+      - govgis_nov2023-slim-spatial-server
+    ports:
+      - "80:80"
+
+
+volumes:
+  govgis_nov2023-slim-spatial-server_pgdata:
+  govgis_nov2023-slim-spatial-server_pgadmin_data:
+
+networks:
+  govgis_nov2023-slim-spatial-server:
+    driver: bridge
