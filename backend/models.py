@@ -39,15 +39,11 @@ class Point(BaseModel):
         x, y = transformer.transform(self.longitude, self.latitude)
         return Point(longitude=x, latitude=y, epsg=dst_epsg)
 
-    @model_validator(mode="after")
-    def check_epsg4326(self) -> Point:
-        return Point4326(**self.model_dump()) if self.epsg == 4326 else self
-
 
 class Point4326(Point):
     """A point with longitude and latitude coordinates in EPSG 4326."""
 
-    @model_validator(mode="before")
+    @model_validator(mode="after")
     def check_epsg(self) -> Point:
         return self if self.epsg == 4326 else self.reproject(4326)
 
