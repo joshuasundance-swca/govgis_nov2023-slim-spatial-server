@@ -55,6 +55,7 @@ async def search(
     embedding_model=Depends(get_embedding_model),
 ) -> dict:
     query_str = request.build_query(embedding_model)
+    print(query_str)
     try:
         layers = await conn.fetch(query_str)
     except Exception as e:

@@ -117,7 +117,7 @@ class SemanticSearchRequest(BaseModel):
     def type_filter_query(self) -> str:
         if self.type_filter is None:
             return ""
-        typestr = ",".join([t.lower() for t in self.type_filter])
+        typestr = ",".join([f"'{t.lower()}'" for t in self.type_filter])
         return f"LOWER(type) IN ({typestr})"
 
     def build_query(self, embedding_model) -> str:
