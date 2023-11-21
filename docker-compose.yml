@@ -12,6 +12,7 @@ services:
       - govgis_nov2023-slim-spatial-server
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "postgres"]
+
     ports:
       - "5432:5432"
 
