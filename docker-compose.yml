@@ -13,9 +13,6 @@ services:
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "postgres"]
 
-    ports:
-      - "5432:5432"
-
   postgres-init:
     build: .
     env_file:
@@ -31,22 +28,24 @@ services:
     working_dir: /home/appuser/backend
     command: ["python", "load_data.py"]
 
-#  backend:
-#    build: .
-#    env_file:
-#      - .env
-#    volumes:
-#      - ./backend/backend:/home/appuser/backend
-#    networks:
-#      - govgis_nov2023-slim-spatial-server
-#    ports:
-#      - "${BACKEND_PORT:-8080}:8080"
-#    depends_on:
-#      postgres:
-#        condition: service_healthy
-#      postgres-init:
-#        condition: service_completed_successfully
-#    working_dir: /home/appuser/backend
+  backend:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/home/appuser/backend
+      - ./models:/home/appuser/models
+    networks:
+      - govgis_nov2023-slim-spatial-server
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+    working_dir: /home/appuser/backend
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
 #    command: ["gunicorn", "app:app"]
 
   pgadmin:
@@ -59,7 +58,7 @@ services:
     networks:
       - govgis_nov2023-slim-spatial-server
     ports:
-      - "80:80"
+      - "${PGADMIN_PORT:-8080}:8080"
 
 
 volumes:

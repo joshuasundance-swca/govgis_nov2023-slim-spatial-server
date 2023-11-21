@@ -1,4 +1,5 @@
 govgis-nov2023/
+models/
 *$py.class
 *.chainlit
 *.chroma

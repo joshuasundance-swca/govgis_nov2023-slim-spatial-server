@@ -33,8 +33,8 @@ def check_env_vars() -> None:
         "POSTGRES_HOST",
         "POSTGRES_DB",
         "GEOPARQUET_PATH",
-        "READ_ONLY_USER",
-        "READ_ONLY_USER_PASSWORD",
+        "READ_ONLY_POSTGRES_USER",
+        "READ_ONLY_POSTGRES_USER_PASSWORD",
     ]
 
     optional_env_vars_with_defaults = {
@@ -111,8 +111,8 @@ async def make_user(
 ) -> None:
     """Create the user if it doesn't already exist"""
     user_kwargs = {
-        "read_only_user": os.environ["READ_ONLY_USER"],
-        "read_only_user_password": os.environ["READ_ONLY_USER_PASSWORD"],
+        "read_only_user": os.environ["READ_ONLY_POSTGRES_USER"],
+        "read_only_user_password": os.environ["READ_ONLY_POSTGRES_USER_PASSWORD"],
         "database": os.environ["POSTGRES_DB"],
         "schema": os.environ["POSTGRES_SCHEMA"],
         "table": os.environ["POSTGRES_TABLE"],
@@ -174,7 +174,6 @@ def data_generator() -> Iterable[tuple[str, str, str, str, str, str, str, str]]:
     """Generate data to be inserted into the database"""
     return (
         gpd.read_parquet(os.environ["GEOPARQUET_PATH"])
-        .head(100)
         .drop_duplicates(subset=["id", "metadata_text"])
         .rename(columns={"geometry": "geom"})[table_columns]
         .itertuples(index=False)
