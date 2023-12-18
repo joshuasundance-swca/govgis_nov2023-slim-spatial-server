@@ -10,7 +10,7 @@ jupyterlab==4.0.9
 langchain==0.0.350
 langsmith==0.0.69
 nest-asyncio==1.5.8
-openai==1.3.8
+openai==1.5.0
 pgvector==0.2.4
 psycopg2-binary==2.9.9
 pyarrow==14.0.1
