@@ -22,4 +22,4 @@ shapely==2.0.2
 SQLAlchemy==2.0.23
 torch==2.1.2 -f https://download.pytorch.org/whl/cpu/torch_stable.html
 tqdm==4.66.1
-uvicorn==0.24.0.post1
+uvicorn==0.25.0
