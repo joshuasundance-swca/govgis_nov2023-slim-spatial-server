@@ -4,7 +4,7 @@ fastapi==0.109.2
 # torchvision==0.16.1+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html
 GeoAlchemy2==0.14.3
 geopandas==0.14.3
-gunicorn==21.2.0
+gunicorn==22.0.0
 ipywidgets==8.1.1
 jupyterlab==4.0.12
 langchain==0.1.5
@@ -21,5 +21,8 @@ sentence-transformers==2.3.1
 shapely==2.0.2
 SQLAlchemy==2.0.25
 torch==2.2.0 -f https://download.pytorch.org/whl/cpu/torch_stable.html
-tqdm==4.66.1
+tqdm==4.66.3
 uvicorn==0.27.0.post1
+anyio>=4.4.0 # not directly required, pinned by Snyk to avoid a vulnerability
+setuptools>=70.0.0 # not directly required, pinned by Snyk to avoid a vulnerability
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
