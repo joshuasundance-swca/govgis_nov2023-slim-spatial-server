@@ -4,7 +4,7 @@ fastapi==0.109.2
 # torchvision==0.16.1+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html
 GeoAlchemy2==0.14.3
 geopandas==0.14.3
-gunicorn==21.2.0
+gunicorn==23.0.0
 ipywidgets==8.1.1
 jupyterlab==4.0.12
 langchain==0.1.5
