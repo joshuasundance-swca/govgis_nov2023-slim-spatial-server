@@ -3,7 +3,6 @@ version: '3.8'
 services:
   postgres:
     image: joshuasundance/postgis_pgvector:1.0.0
-    container_name: postgres
     env_file:
       - .env
     volumes:
@@ -14,7 +13,10 @@ services:
       test: ["CMD", "pg_isready", "-U", "postgres"]
 
   postgres-init:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: base
     env_file:
       - .env
     volumes:
@@ -29,7 +31,10 @@ services:
     command: ["python", "load_data.py"]
 
   backend:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: base
     env_file:
       - .env
     volumes:
@@ -48,9 +53,37 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
 #    command: ["gunicorn", "app:app"]
 
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: mcp
+    env_file:
+      - .env
+    networks:
+      - govgis_nov2023-slim-spatial-server
+    volumes:
+      - ./backend:/home/appuser/backend
+    ports:
+      - "${MCP_PORT:-8081}:8081"
+    depends_on:
+      backend:
+        condition: service_started
+    working_dir: /home/appuser/backend
+    command: ["fastmcp", "run", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8081", "--no-banner", "mcp.py"]
+
+  inspector:
+    image: ghcr.io/modelcontextprotocol/inspector:latest
+    environment:
+      - HOST=0.0.0.0
+    networks:
+      - govgis_nov2023-slim-spatial-server
+    ports:
+      - "6274:6274"
+      - "6277:6277"
+
   pgadmin:
     image: dpage/pgadmin4:7.8
-    container_name: pgadmin
     env_file:
       - .env
     volumes:

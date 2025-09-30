@@ -15,6 +15,8 @@
 
 🤖 This README was written by GPT-4. 🤖
 
+# UPDATE: added an mcp server with `fastmcp`.
+
 ## Introduction
 
 `govgis_nov2023-slim-spatial-server` is a Dockerized project combining `PostGIS` and `pgvector` extensions to process and serve a comprehensive geospatial dataset, `govgis_nov2023`. This project aims to provide a robust framework for efficient handling and querying of geospatial data along with high-dimensional vector similarity search capabilities, leveraging the power of PostgreSQL.
@@ -46,6 +48,9 @@ The `docker-compose.yml` file in this project defines multiple services:
 ## Database Initialization
 
 The `postgres-init` service is responsible for loading data into the database. It processes the `govgis_nov2023` dataset, transforming it into a suitable format for PostgreSQL, and then populates the database.
+
+Download [the dataset](https://huggingface.co/datasets/joshuasundance/govgis_nov2023-slim-spatial/blob/main/govgis_nov2023_slim_spatial_embs.geoparquet) and
+place it in `./govgis-nov2023` (according to the `docker-compose.yml` volume mapping).
 
 ## Customization
 

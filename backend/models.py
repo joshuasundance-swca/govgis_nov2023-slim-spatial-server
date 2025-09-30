@@ -92,6 +92,8 @@ class SemanticSearchRequest(BaseModel):
     @field_validator("input_point")
     @classmethod
     def check_input_point(cls, v: Point) -> Point:
+        if not v:
+            return v
         return Point4326(**v.model_dump())
 
     @staticmethod

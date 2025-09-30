@@ -5,7 +5,7 @@ from asyncpg.connection import Connection
 from fastapi import FastAPI, Depends
 from langchain.embeddings import HuggingFaceBgeEmbeddings
 
-from models import SemanticSearchRequest, SearchResponse  # type: ignore
+from models import SemanticSearchRequest, SearchResponse, LayerResult  # type: ignore[attr-defined]
 
 __version__ = "0.0.1"
 
@@ -53,12 +53,15 @@ async def search(
     request: SemanticSearchRequest,
     conn: Connection = Depends(get_connection),
     embedding_model=Depends(get_embedding_model),
-) -> dict:
+) -> SearchResponse:
     query_str = request.build_query(embedding_model)
     print(query_str)
     try:
         layers = await conn.fetch(query_str)
     except Exception as e:
         print(e)
-        return dict(error=str(e))
-    return dict(layers=[dict(record) for record in layers])
+        return SearchResponse(layers=None, error=str(e))
+    return SearchResponse(
+        layers=[LayerResult.model_validate(dict(record)) for record in layers],
+        error=None,
+    )
