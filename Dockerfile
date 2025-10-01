@@ -12,4 +12,5 @@ COPY ./requirements.txt /home/appuser/requirements.txt
 RUN pip install --user --no-cache-dir  --upgrade -r /home/appuser/requirements.txt
 
 FROM base AS mcp
-RUN pip install --user --no-cache-dir fastmcp markdownify
+COPY ./requirements.mcp.txt /home/appuser/requirements.mcp.txt
+RUN pip install --user --no-cache-dir --upgrade -r /home/appuser/requirements.mcp.txt

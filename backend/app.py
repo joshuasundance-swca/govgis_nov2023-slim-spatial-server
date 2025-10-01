@@ -37,29 +37,19 @@ def get_embedding_model():
     return _embedding_model
 
 
-# async def stream_records(cursor: AsyncIOMotorCursor) -> AsyncGenerator[str, None]:
-#     yield "["
-#     first_item = True
-#     async for document in cursor:
-#         if not first_item:
-#             yield ","
-#         yield Layer.model_validate(document).model_dump_json()
-#         first_item = False
-#     yield "]"
-
-
 @app.post("/search", response_model=SearchResponse)
 async def search(
     request: SemanticSearchRequest,
     conn: Connection = Depends(get_connection),
     embedding_model=Depends(get_embedding_model),
 ) -> SearchResponse:
-    query_str = request.build_query(embedding_model)
-    print(query_str)
+    query, params = request.build_query(embedding_model)
+    # Debug print (can be switched to logging). Avoid printing sensitive params directly.
+    print("Executing semantic search query with", len(params), "parameters")
     try:
-        layers = await conn.fetch(query_str)
+        layers = await conn.fetch(query, *params)
     except Exception as e:
-        print(e)
+        print("Search error:", e)
         return SearchResponse(layers=None, error=str(e))
     return SearchResponse(
         layers=[LayerResult.model_validate(dict(record)) for record in layers],
