@@ -58,7 +58,22 @@ def check_env_vars() -> None:
         "POSTGRES_SCHEMA": "public",
         "POSTGRES_TABLE": "layers",
         "SPATIAL_INDEX_NAME": "layer_extent_index",
+        # Vector index related defaults
+        "VECTOR_INDEX_NAME": "layer_embedding_index",
+        "VECTOR_INDEX_TYPE": "ivfflat",
+        "VECTOR_METRIC": "l2",
+        "VECTOR_IVFFLAT_LISTS": "100",
+        "VECTOR_HNSW_M": "16",
+        "VECTOR_HNSW_EF_CONSTRUCTION": "64",
         "PGVECTOR_DIM": "1024",
+        # High-volume load tuning
+        "LOADER_COMMIT_INTERVAL": "100000",
+        "LOADER_PERFORMANCE_TWEAKS": "true",
+        "LOADER_WORK_MEM": "128MB",
+        "LOADER_TEMP_BUFFERS": "32MB",
+        "LOADER_SYNCHRONOUS_COMMIT": "off",
+        # Loader method: copy (default) or executemany
+        "LOADER_METHOD": "copy",
     }
 
     for env_var in required_env_vars:
@@ -76,14 +91,55 @@ def check_env_vars() -> None:
     os.environ["READ_ONLY_POSTGRES_USER"] = safe_identifier(
         os.environ["READ_ONLY_POSTGRES_USER"],
     )
+    os.environ["VECTOR_INDEX_NAME"] = safe_identifier(os.environ["VECTOR_INDEX_NAME"])
+
     dim = os.environ.get("PGVECTOR_DIM", "1024")
-    if not dim.isdigit():  # pragma: no cover (defensive)
+    if not dim.isdigit():
         raise ValueError("PGVECTOR_DIM must be an integer string")
     os.environ["PGVECTOR_DIM"] = dim
 
+    index_type = os.environ.get("VECTOR_INDEX_TYPE", "ivfflat").lower()
+    if index_type not in {"ivfflat", "hnsw"}:
+        raise ValueError("VECTOR_INDEX_TYPE must be either 'ivfflat' or 'hnsw'")
+    os.environ["VECTOR_INDEX_TYPE"] = index_type
+
+    metric = os.environ.get("VECTOR_METRIC", "l2").lower()
+    metric_map = {
+        "l2": "vector_l2_ops",
+        "cosine": "vector_cosine_ops",
+        "ip": "vector_ip_ops",
+    }
+    if metric not in metric_map:
+        raise ValueError("VECTOR_METRIC must be one of: l2, cosine, ip")
+    os.environ["VECTOR_METRIC"] = metric
+    os.environ["_VECTOR_OPS_CLASS"] = metric_map[metric]
+
+    lists = os.environ.get("VECTOR_IVFFLAT_LISTS", "100")
+    if not lists.isdigit() or int(lists) <= 0:
+        raise ValueError("VECTOR_IVFFLAT_LISTS must be positive integer")
+    m_val = os.environ.get("VECTOR_HNSW_M", "16")
+    efc = os.environ.get("VECTOR_HNSW_EF_CONSTRUCTION", "64")
+    if not (m_val.isdigit() and int(m_val) > 0):
+        raise ValueError("VECTOR_HNSW_M must be positive integer")
+    if not (efc.isdigit() and int(efc) > 0):
+        raise ValueError("VECTOR_HNSW_EF_CONSTRUCTION must be positive integer")
+
+    commit_interval = os.environ.get("LOADER_COMMIT_INTERVAL", "100000")
+    if not (commit_interval.isdigit() and int(commit_interval) >= 0):
+        raise ValueError("LOADER_COMMIT_INTERVAL must be >= 0 integer")
+
+    loader_method = os.environ.get("LOADER_METHOD", "copy").lower()
+    if loader_method not in {"copy", "executemany"}:
+        raise ValueError("LOADER_METHOD must be 'copy' or 'executemany'")
+    os.environ["LOADER_METHOD"] = loader_method
+
 
 def check_geoparquet_path() -> None:
-    """Check that the GEOPARQUET_PATH environment variable points to a valid path"""
+    """Validate GEOPARQUET_PATH exists before attempting load.
+
+    Raises FileNotFoundError if the path is missing. Split out so we can call
+    only when we actually need to load data (avoids requiring the file when
+    table already populated and we just want to ensure indexes / user)."""
     geoparquet_path = os.environ.get("GEOPARQUET_PATH")
     if not geoparquet_path or not os.path.exists(geoparquet_path):
         raise FileNotFoundError(
@@ -146,6 +202,66 @@ async def make_index(conn: AsyncConnection) -> None:
     ).format(index=index_ident, table=table_ident)
     async with conn.cursor() as cur:
         await cur.execute(create_index_stmt)
+
+
+async def make_vector_index(conn: AsyncConnection) -> None:
+    """Create the vector similarity index on embeddings if it does not exist.
+
+    Supports ivfflat (default) and hnsw index types.
+    Parameters are controlled via environment variables set/validated in check_env_vars().
+    - VECTOR_INDEX_NAME (identifier)
+    - VECTOR_INDEX_TYPE (ivfflat | hnsw)
+    - VECTOR_METRIC (l2 | cosine | ip) -> mapped to ops class
+    - VECTOR_IVFFLAT_LISTS (only for ivfflat)
+    - VECTOR_HNSW_M, VECTOR_HNSW_EF_CONSTRUCTION (only for hnsw)
+
+    If creation fails (e.g., unsupported index type in installed pgvector version), logs a warning.
+    """
+    table_ident = sql.Identifier(os.environ["POSTGRES_TABLE"])
+    index_ident = sql.Identifier(os.environ["VECTOR_INDEX_NAME"])
+    ops_class = os.environ["_VECTOR_OPS_CLASS"]  # already validated mapping
+    index_type = os.environ["VECTOR_INDEX_TYPE"]
+
+    if index_type == "ivfflat":
+        lists = int(os.environ["VECTOR_IVFFLAT_LISTS"])
+        ddl = sql.SQL(
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} USING ivfflat (embeddings {ops}) WITH (lists = {lists})",
+        ).format(
+            index=index_ident,
+            table=table_ident,
+            ops=sql.SQL(ops_class),
+            lists=sql.Literal(lists),
+        )
+    else:  # hnsw
+        m_val = int(os.environ["VECTOR_HNSW_M"])
+        efc = int(os.environ["VECTOR_HNSW_EF_CONSTRUCTION"])
+        ddl = sql.SQL(
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} USING hnsw (embeddings {ops}) WITH (m = {m}, ef_construction = {efc})",
+        ).format(
+            index=index_ident,
+            table=table_ident,
+            ops=sql.SQL(ops_class),
+            m=sql.Literal(m_val),
+            efc=sql.Literal(efc),
+        )
+
+    async with conn.cursor() as cur:
+        try:
+            await cur.execute(ddl)
+            # ANALYZE recommended especially for ivfflat to collect stats for planner
+            await cur.execute(sql.SQL("ANALYZE {table}").format(table=table_ident))
+            logging.info(
+                "Vector index ensured (type=%s, metric=%s, name=%s)",
+                index_type,
+                os.environ["VECTOR_METRIC"],
+                os.environ["VECTOR_INDEX_NAME"],
+            )
+        except Exception as e:  # pragma: no cover (environment specific)
+            logging.warning(
+                "Vector index creation failed (type=%s). Continuing without it: %s",
+                index_type,
+                e,
+            )
 
 
 make_user_sql = """CREATE ROLE {read_only_user} WITH LOGIN PASSWORD '{read_only_user_password}';
@@ -393,18 +509,180 @@ INSERT_SQL_TEMPLATE = sql.SQL(
 
 
 async def load_data(conn: AsyncConnection) -> None:
-    """Load data into the database using batched executemany."""
+    """Load data using COPY (default) or batched executemany (fallback).
+
+    COPY path:
+      1. Create a temporary staging table with embeddings TEXT and geom_wkb BYTEA.
+      2. Stream rows via PostgreSQL COPY.
+      3. Insert-transform into target table casting embeddings::vector and ST_GeomFromWKB.
+      4. Single final commit.
+
+    Executemany fallback retains prior behavior (honors LOADER_COMMIT_INTERVAL).
+    """
+    method = os.environ.get("LOADER_METHOD", "copy")
+    if method == "executemany":
+        logging.info("LOADER_METHOD=executemany selected (legacy path)")
+        await _load_data_executemany(conn)
+        return
+    logging.info("LOADER_METHOD=copy selected (bulk COPY path)")
+
+    # Session tweaks (still valuable for COPY)
+    tweaks = os.environ.get("LOADER_PERFORMANCE_TWEAKS", "true").lower() == "true"
+    async with conn.cursor() as cur:
+        if tweaks:
+            settings = {
+                "synchronous_commit": os.environ.get(
+                    "LOADER_SYNCHRONOUS_COMMIT",
+                    "off",
+                ),
+                "work_mem": os.environ.get("LOADER_WORK_MEM", "128MB"),
+                "temp_buffers": os.environ.get("LOADER_TEMP_BUFFERS", "32MB"),
+            }
+            for k, v in settings.items():
+                try:
+                    await cur.execute(
+                        sql.SQL("SET {} TO {}").format(  # type: ignore[arg-type]
+                            sql.SQL(k),
+                            sql.Literal(v),
+                        ),
+                    )
+                except Exception as e:  # pragma: no cover
+                    logging.info(f"Skipping load tweak {k}={v}: {e}")
+
+        # 1. Temp staging table
+        await cur.execute(
+            """
+            CREATE TEMP TABLE temp_layers_stage (
+                id text,
+                name text,
+                type text,
+                description text,
+                url text,
+                metadata_text text,
+                embeddings text,
+                geom_wkb bytea
+            ) ON COMMIT DROP
+            """,
+        )
+        logging.info("Created temporary staging table for COPY")
+
+        # 2. COPY stream
+        copy_stmt = "COPY temp_layers_stage (id,name,type,description,url,metadata_text,embeddings,geom_wkb) FROM STDIN"
+        total = 0
+        async with cur.copy(copy_stmt) as copy:
+            for rec in record_generator():
+                (
+                    id_,
+                    name,
+                    type_,
+                    description,
+                    url,
+                    metadata_text,
+                    emb_lit,
+                    geom_wkb,
+                ) = rec
+                # emb_lit already like '[...]' or None
+                # psycopg will adapt None -> NULL, bytes -> bytea hex
+                await copy.write_row(
+                    [
+                        id_,
+                        name,
+                        type_,
+                        description,
+                        url,
+                        metadata_text,
+                        emb_lit,
+                        psycopg.Binary(geom_wkb),
+                    ],
+                )
+                total += 1
+                if total % 100000 == 0:
+                    logging.info("COPY streamed %d rows...", total)
+        logging.info("Finished COPY streaming %d rows", total)
+
+        # 3. Insert-transform
+        target_table = sql.Identifier(os.environ["POSTGRES_TABLE"])
+        insert_transform = sql.SQL(
+            """
+            INSERT INTO {target} (id,name,type,description,url,metadata_text,embeddings,geom)
+            SELECT id,name,type,description,url,metadata_text,
+                   CASE WHEN embeddings IS NULL THEN NULL ELSE embeddings::vector END,
+                   ST_SetSRID(ST_GeomFromWKB(geom_wkb),4326)
+            FROM temp_layers_stage
+            """,
+        ).format(target=target_table)
+        await cur.execute(insert_transform)
+        logging.info("Inserted %d rows from staging into target table", total)
+        await conn.commit()
+        logging.info("Committed COPY load")
+
+    logging.info("Data load complete (COPY path)")
+
+
+# Legacy executemany path retained for fallback / comparison
+async def _load_data_executemany(
+    conn: AsyncConnection,
+) -> None:  # pragma: no cover (optional path)
     insert_sql = INSERT_SQL_TEMPLATE.format(
         table=sql.Identifier(os.environ["POSTGRES_TABLE"]),
     )
-    async with conn.transaction():
-        async with conn.cursor() as cur:
-            total = 0
+    commit_interval = int(os.environ.get("LOADER_COMMIT_INTERVAL", "100000"))
+    tweaks = os.environ.get("LOADER_PERFORMANCE_TWEAKS", "true").lower() == "true"
+
+    async with conn.cursor() as cur:
+        if tweaks:
+            settings = {
+                "synchronous_commit": os.environ.get(
+                    "LOADER_SYNCHRONOUS_COMMIT",
+                    "off",
+                ),
+                "work_mem": os.environ.get("LOADER_WORK_MEM", "128MB"),
+                "temp_buffers": os.environ.get("LOADER_TEMP_BUFFERS", "32MB"),
+            }
+            for k, v in settings.items():
+                try:
+                    await cur.execute(
+                        sql.SQL("SET {} TO {}").format(  # type: ignore[arg-type]
+                            sql.SQL(k),
+                            sql.Literal(v),
+                        ),
+                    )
+                except Exception as e:
+                    logging.info(f"Skipping load tweak {k}={v}: {e}")
+        total = 0
+        batch_no = 0
+        if commit_interval == 0:
+            async with conn.transaction():
+                for chunk in batched(record_generator(), INIT_LOADER_BATCH_SIZE):
+                    await cur.executemany(insert_sql, chunk)  # type: ignore[arg-type]
+                    total += len(chunk)
+                    batch_no += 1
+                    if batch_no % 50 == 0:
+                        logging.info(
+                            "Inserted %d rows so far (single transaction mode)",
+                            total,
+                        )
+        else:
             for chunk in batched(record_generator(), INIT_LOADER_BATCH_SIZE):
                 await cur.executemany(insert_sql, chunk)  # type: ignore[arg-type]
                 total += len(chunk)
-                logging.info(f"Inserted {total} records ...")
-    logging.info("Data load complete")
+                batch_no += 1
+                if total % commit_interval == 0:
+                    await conn.commit()
+                    logging.info(
+                        "Committed %d rows (commit interval %d)",
+                        total,
+                        commit_interval,
+                    )
+                elif batch_no % 50 == 0:
+                    logging.info(
+                        "Inserted %d rows so far (pending commit at %d)",
+                        total,
+                        commit_interval,
+                    )
+            await conn.commit()
+            logging.info("Final commit after inserting %d rows", total)
+    logging.info("Data load complete (executemany path)")
 
 
 async def amain() -> None:
@@ -435,10 +713,12 @@ async def amain() -> None:
 
         logging.info("Making spatial index")
         await make_index(conn)
+        logging.info("Making vector index")
+        await make_vector_index(conn)
         # Commit index creation
         try:
             await conn.commit()
-            logging.info("Committed spatial index creation")
+            logging.info("Committed spatial & vector index creation")
         except Exception as e:  # pragma: no cover
             logging.warning(f"Commit after index creation failed (continuing): {e}")
 
@@ -453,13 +733,14 @@ async def amain() -> None:
 
     else:
         logging.info(
-            "Table already had data; skipping load/index but ensuring read-only user exists",
+            "Table already had data; skipping load but ensuring indexes & read-only user exist",
         )
-        await make_index(conn)  # safe idempotent, ensures index if added later
+        await make_index(conn)  # safe idempotent, ensures spatial index
+        await make_vector_index(conn)  # ensure vector index
         try:
             await conn.commit()
         except Exception as e:  # pragma: no cover
-            logging.warning("Commit after ensuring index skipped or failed: %s", e)
+            logging.warning("Commit after ensuring indexes skipped or failed: %s", e)
         await make_user(conn)
         try:
             await conn.commit()

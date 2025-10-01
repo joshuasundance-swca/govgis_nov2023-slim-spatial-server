@@ -21,6 +21,9 @@
 - Rewrote data loader to use batched psycopg async executemany with pgvector + PostGIS
 - Removed custom asyncpg codecs and copy logic; simplified vector + geometry insertion
 - Added configurable eager pool warm-up + partial warm targeting and embedding model warm-up (see "Performance & Pooling")
+- Added vector similarity index creation (ivfflat or hnsw) + tuning env vars
+- Added high-volume (~1M rows) bulk load tuning (commit interval + session tweaks)
+- Introduced COPY-based high-performance ingestion (default) via `LOADER_METHOD=copy` with deferred index creation until after all rows are loaded
 
 ## UPDATES (09/30/2025)
 - moved from python 3.11 to python 3.13
@@ -37,33 +40,95 @@
 
 ## Components
 
-- `PostGIS`: An extension of PostgreSQL, enabling it to store and manipulate spatial data.
-- `pgvector`: A PostgreSQL extension for efficient similarity searches in high-dimensional vector spaces.
-- `govgis_nov2023`: A rich dataset encapsulating metadata from various government GIS servers as of November 2023.
+- `PostGIS`: Spatial indexing & geometry functions.
+- `pgvector`: Approximate / exact vector similarity search (supports ivfflat & hnsw indexes here).
+- `govgis_nov2023`: Metadata + embeddings derived from public GIS endpoints (Nov 2023 snapshot).
 
 ### Docker Composition
 
 The `docker-compose.yml` file in this project defines multiple services:
 
 1. **postgres**: Utilizes the `joshuasundance/postgis_pgvector:1.0.0` image, incorporating both PostGIS and pgvector.
-2. **postgres-init**: A service to initialize the database with data from the `govgis_nov2023` dataset.
+2. **postgres-init**: A service to initialize and load nearly a million rows from the geoparquet file.
 3. **pgadmin**: Provides a web interface for database management using `dpage/pgadmin4:7.8`.
 
 ## Usage
 
 1. **Setup**: Clone the repository and navigate to the directory containing the `docker-compose.yml` file.
-2. **Configuration**: Adjust the `.env` file to set necessary environment variables.
-3. **Build and Run**: Execute `docker compose up` to build and start the services.
-4. **Access pgAdmin**: Open `http://localhost:80` in a web browser for database management.
+2. **Configuration**: Copy `.env-example` to `.env` and adjust paths & secrets.
+3. **Download Dataset**: Place the `govgis_nov2023_slim_spatial_embs.geoparquet` file into `./govgis-nov2023`.
+4. **Build and Run**: `docker compose up --build` (first run will ingest data, taking several minutes depending on hardware / IO & index strategy).
+5. **Access pgAdmin**: Open `http://localhost:80`.
 
 ## Database Initialization
 
-The `postgres-init` service is responsible for loading data into the database. It processes the `govgis_nov2023` dataset, transforming it into a suitable format for PostgreSQL, and then populates the database.
+The `postgres-init` service loads (up to) ~1,000,000 rows, transforming embeddings + polygon geometries, enforcing dimensionality, and then (after the data load completes) creates:
+- A spatial GiST index on `geom`
+- A vector similarity index (configurable: ivfflat or hnsw) on `embeddings`
+- A read-only role with `SELECT` privileges for application access.
 
-Download [the dataset](https://huggingface.co/datasets/joshuasundance/govgis_nov2023-slim-spatial/blob/main/govgis_nov2023_slim_spatial_embs.geoparquet) and
-place it in `./govgis-nov2023` (according to the `docker-compose.yml` volume mapping).
+Index creation is intentionally deferred until all rows are inserted to maximize ingestion throughput and avoid incremental index maintenance overhead.
+
+## Vector Similarity Indexing
+
+Environment variables control how the embeddings index is built:
+- `VECTOR_INDEX_TYPE`: `ivfflat` (default) or `hnsw`.
+- `VECTOR_METRIC`: `l2`, `cosine`, or `ip` (inner product). Mapped to the proper operator class automatically.
+- `VECTOR_INDEX_NAME`: Name of the index (default `layer_embedding_index`).
+- `PGVECTOR_DIM`: Embedding dimension (must match dataset; enforced per row).
+
+Type-specific parameters:
+- ivfflat: `VECTOR_IVFFLAT_LISTS` (default 100). Rough tuning heuristic: choose lists near √N or N / 1000. For ~1M rows consider 1000–2000 for improved recall.
+- hnsw: `VECTOR_HNSW_M` (graph degree, default 16) and `VECTOR_HNSW_EF_CONSTRUCTION` (construction search breadth, default 64). For higher recall at cost of build time, consider M=32, EF=200.
+
+Rebuilding the index: adjust vars then drop the existing vector index in psql (`DROP INDEX IF EXISTS layer_embedding_index;`) and rerun the loader (data load is skipped if already present; index recreated).
+
+Example query (L2 distance):
+```
+SELECT id, name, embeddings <-> '[0.12,0.34,...]' AS dist
+FROM layers
+ORDER BY embeddings <-> '[0.12,0.34,...]'
+LIMIT 10;
+```
+Cosine (requires `VECTOR_METRIC=cosine` at index build):
+```
+SELECT id, name, embeddings <=> '[0.12,0.34,...]' AS cosine_distance
+FROM layers
+ORDER BY embeddings <=> '[0.12,0.34,...]'
+LIMIT 10;
+```
+
+## High-Volume Load Tuning (~1M Rows)
+
+The loader provides knobs to balance speed, WAL size, and crash safety.
+
+Loader method:
+- `LOADER_METHOD=copy` (default): Uses a temporary staging table + PostgreSQL COPY for fastest ingestion, then bulk INSERT-select transform into the target table.
+- `LOADER_METHOD=executemany`: Falls back to batched parameter inserts (slower, but simpler; useful for debugging or if COPY issues arise).
+
+Core variables:
+- `INIT_LOADER_BATCH_SIZE` (executemany only; default 500): Rows per batch when not using COPY.
+- `LOADER_COMMIT_INTERVAL` (executemany only; default 100000): Rows between commits. Ignored in COPY mode (COPY path commits once at end).
+- `LOADER_PERFORMANCE_TWEAKS` (default true): Applies session changes:
+  - `synchronous_commit` (default off for speed – set `LOADER_SYNCHRONOUS_COMMIT=on` for durability)
+  - `work_mem`
+  - `temp_buffers`
+
+Additional tuning:
+- For COPY, `LOADER_COMMIT_INTERVAL` is intentionally ignored since COPY already streams efficiently and one final commit is fastest.
+- Ensure dataset file resides on fast local storage (container volume on SSD preferable).
+
+Recommended scenarios:
+- Fast initial load: `LOADER_METHOD=copy`, tweaks on (defaults suffice).
+- Diagnostic / controlled: `LOADER_METHOD=executemany`, `LOADER_COMMIT_INTERVAL=50000`, synchronous commit on.
+
+Progress Logs:
+- COPY: Logs every 100k streamed rows.
+- executemany: Logs every 50 batches and at each configured commit boundary.
 
 ## Performance & Pooling
+
+(Existing section retained, now complemented by loader tuning.)
 
 To minimize first-request latency and control connection behavior, several environment variables are available:
 
@@ -72,72 +137,64 @@ Core variables (existing):
 - `READ_ONLY_POSTGRES_USER`, `READ_ONLY_POSTGRES_USER_PASSWORD`: A read-only role is auto-created / updated on startup if needed.
 - `POSTGRES_SCHEMA` (default `public`), `POSTGRES_TABLE` (default `layers`).
 
-Pooling / warm-up variables (new):
-- `PG_POOL_MAX_SIZE` (default `10`): Upper bound of concurrent DB connections in the async pool.
-- `PG_POOL_MIN_SIZE` (default `1`): Minimum number of kept-open connections (ignored if eager mode is on).
-- `PG_POOL_EAGER` (default `false`): When true, sets `min_size = max_size` and warms all connections immediately.
-- `PG_POOL_WARM_TARGET` (optional int): If not eager, pre-initialize up to this many connections (capped by `PG_POOL_MAX_SIZE`).
-- `PG_POOL_TIMEOUT` (default `30` seconds): How long a request waits for a free connection before raising an error.
-- `EMBEDDING_WARMUP` (default `true`): Pre-computes a single embedding at startup so the model is JIT-loaded before traffic.
+Pooling / warm-up variables:
+- `PG_POOL_MAX_SIZE`, `PG_POOL_MIN_SIZE`, `PG_POOL_EAGER`, `PG_POOL_WARM_TARGET`, `PG_POOL_TIMEOUT`, `EMBEDDING_WARMUP`.
 
-Behavior precedence:
-1. If `PG_POOL_EAGER=true`, the pool will attempt to fully open and validate `PG_POOL_MAX_SIZE` connections; `PG_POOL_WARM_TARGET` is ignored.
-2. If `PG_POOL_EAGER=false` and `PG_POOL_WARM_TARGET` is set, that many connections are warmed (minimum of configured target and `PG_POOL_MAX_SIZE`).
-3. If neither eager nor warm target is set, only `PG_POOL_MIN_SIZE` connections are opened initially; additional are created lazily on demand.
+## Environment Variable Reference (Summary)
 
-Recommended setups:
-- Local development (fast startup, ok with a small first-hit penalty):
-  - `PG_POOL_EAGER=false`, `PG_POOL_MIN_SIZE=1`, omit warm target.
-- Low-latency demo / production small instance (predictable concurrency < 10):
-  - `PG_POOL_EAGER=true`, adjust `PG_POOL_MAX_SIZE` to expected peak.
-- Burst traffic with moderate DB budget:
-  - `PG_POOL_EAGER=false`, `PG_POOL_WARM_TARGET=4` (or similar), `PG_POOL_MAX_SIZE=16` (connections above warm target are created lazily).
+Data & table:
+- `GEOPARQUET_PATH`, `POSTGRES_SCHEMA`, `POSTGRES_TABLE`, `PGVECTOR_DIM`
 
-Example docker-compose service override:
+Vector indexing:
+- `VECTOR_INDEX_TYPE`, `VECTOR_METRIC`, `VECTOR_INDEX_NAME`, `VECTOR_IVFFLAT_LISTS`, `VECTOR_HNSW_M`, `VECTOR_HNSW_EF_CONSTRUCTION`
+
+Loader performance & method:
+- `LOADER_METHOD`, `INIT_LOADER_BATCH_SIZE` (executemany only), `LOADER_COMMIT_INTERVAL` (executemany only), `LOADER_PERFORMANCE_TWEAKS`, `LOADER_WORK_MEM`, `LOADER_TEMP_BUFFERS`, `LOADER_SYNCHRONOUS_COMMIT`
+
+Spatial indexing:
+- `SPATIAL_INDEX_NAME`
+
+Security / roles:
+- `READ_ONLY_POSTGRES_USER`, `READ_ONLY_POSTGRES_USER_PASSWORD`
+
+Connection pooling:
+- `PG_POOL_MAX_SIZE`, `PG_POOL_MIN_SIZE`, `PG_POOL_EAGER`, `PG_POOL_WARM_TARGET`, `PG_POOL_TIMEOUT`
+
+Misc:
+- `LOG_LEVEL`, `EMBEDDING_WARMUP`
+
+## Quick Start Example (.env Snippet)
 ```
-  backend:
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_DB: govgis
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: example
-      READ_ONLY_POSTGRES_USER: ro
-      READ_ONLY_POSTGRES_USER_PASSWORD: ro_pw
-      PG_POOL_MAX_SIZE: "12"
-      PG_POOL_MIN_SIZE: "2"
-      PG_POOL_WARM_TARGET: "6"   # partial pre-warm
-      PG_POOL_TIMEOUT: "20"
-      EMBEDDING_WARMUP: "true"
-      # Set PG_POOL_EAGER: "true" to fully pre-warm all 12 connections instead
+GEOPARQUET_PATH=/data/govgis_nov2023_slim_spatial_embs.geoparquet
+POSTGRES_HOST=postgres
+POSTGRES_DB=postgres
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgres
+READ_ONLY_POSTGRES_USER=appuser
+READ_ONLY_POSTGRES_USER_PASSWORD=secret
+PGVECTOR_DIM=1024
+VECTOR_INDEX_TYPE=ivfflat
+VECTOR_METRIC=cosine
+VECTOR_IVFFLAT_LISTS=1200
+LOADER_METHOD=copy
+LOADER_PERFORMANCE_TWEAKS=true
+SPATIAL_INDEX_NAME=layer_extent_index
 ```
-
-Windows CMD one-off run (fully eager):
-```
-set PG_POOL_EAGER=true
-set PG_POOL_MAX_SIZE=10
-set PG_POOL_MIN_SIZE=1
-set EMBEDDING_WARMUP=true
-uvicorn backend.app:app --host 0.0.0.0 --port 8000
-```
-
-Latency measurement tips:
-- First request cold latency: `curl -w "First byte: %{time_starttransfer}\n" -o NUL -s http://localhost:8000/docs`
-- Load test (example using `hey`): `hey -z 30s -c 10 http://localhost:8000/health` (add a lightweight health endpoint if desired).
 
 ## Customization
 
 - **Environment Variables**: Modify the `.env` file to set values like `POSTGRES_PASSWORD`, `POSTGRES_USER`, etc.
-- **Data Source**: You can change the source of the `govgis_nov2023` dataset by modifying the `load_data.py` script.
+- **Data Source**: Swap in another geoparquet with same column schema (id,name,type,description,url,metadata_text,embeddings,geometry) + matching embedding dimension.
 
 ## Notes
 
-- Docker and Docker Compose are prerequisites.
-- The project is intended for development and testing purposes.
-- Secure your database and pgAdmin for production use.
+- First full ingestion + index build for ~1M rows can take several minutes; repeat runs skip ingestion if table already populated.
+- If switching metrics (e.g. l2 -> cosine) you must drop the vector index before re-running to rebuild with the new operator class.
+- For production, review durability trade-offs if using `synchronous_commit=off` during load (executemany or COPY session tweaks).
 
 ## Contributing
 
-Contributions to enhance the project are welcome. Please use the standard fork and pull request workflow for contributions.
+Contributions welcome. Please use the standard fork & PR workflow and keep changes focused.
 
 ## License
 
