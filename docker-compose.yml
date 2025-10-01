@@ -4,7 +4,7 @@ services:
     env_file:
       - .env
     volumes:
-      - govgis_nov2023-slim-spatial-server_pgdata:/var/lib/postgresql/data
+      - ./pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "postgres"]
 
@@ -75,11 +75,6 @@ services:
     env_file:
       - .env
     volumes:
-      - govgis_nov2023-slim-spatial-server_pgadmin_data:/var/lib/pgadmin
+      - ./pgadmin_data:/var/lib/pgadmin
     ports:
       - "${PGADMIN_PORT:-80}:80"
-
-
-volumes:
-  govgis_nov2023-slim-spatial-server_pgdata:
-  govgis_nov2023-slim-spatial-server_pgadmin_data:
