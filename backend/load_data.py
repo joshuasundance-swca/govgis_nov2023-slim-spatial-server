@@ -29,7 +29,7 @@ table_columns = [
     "geom",
 ]
 
-BATCH_SIZE = 500
+INIT_LOADER_BATCH_SIZE = int(os.environ.get("INIT_LOADER_BATCH_SIZE", "500"))
 
 
 def safe_identifier(name: str) -> str:
@@ -373,7 +373,7 @@ async def load_data(conn: AsyncConnection) -> None:
     async with conn.transaction():
         async with conn.cursor() as cur:
             total = 0
-            for chunk in batched(record_generator(), BATCH_SIZE):
+            for chunk in batched(record_generator(), INIT_LOADER_BATCH_SIZE):
                 await cur.executemany(sql, chunk)
                 total += len(chunk)
                 logging.info(f"Inserted {total} records ...")
