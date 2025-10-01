@@ -78,10 +78,30 @@ Environment variables control how the embeddings index is built:
 - `PGVECTOR_DIM`: Embedding dimension (must match dataset; enforced per row).
 
 Type-specific parameters:
-- ivfflat: `VECTOR_IVFFLAT_LISTS` (default 100). Rough tuning heuristic: choose lists near √N or N / 1000. For ~1M rows consider 1000–2000 for improved recall.
+- ivfflat: `VECTOR_IVFFLAT_LISTS` (default 100). Rough tuning heuristic: choose lists near √N or N / 1000. For ~1M rows consider 1000–2000 for improved recall. Larger `lists` increases build-time RAM use.
 - hnsw: `VECTOR_HNSW_M` (graph degree, default 16) and `VECTOR_HNSW_EF_CONSTRUCTION` (construction search breadth, default 64). For higher recall at cost of build time, consider M=32, EF=200.
 
-Rebuilding the index: adjust vars then drop the existing vector index in psql (`DROP INDEX IF EXISTS layer_embedding_index;`) and rerun the loader (data load is skipped if already present; index recreated).
+Memory autotuning (ivfflat only):
+- `VECTOR_MAINTENANCE_WORK_MEM_MB` (default 512): Session value requested for `maintenance_work_mem` before build.
+- `VECTOR_MAINTENANCE_WORK_MEM_MAX_MB` (default 2048): Upper bound the autotuner may raise to if the server reports a higher requirement.
+- `VECTOR_AUTOTUNE_INDEX_MEMORY` (default true): When true, if the server error contains a line like `memory required is 525 MB, maintenance_work_mem is 64 MB`, the loader will attempt (once) to raise `maintenance_work_mem` (up to the max) and retry. If still insufficient, it will reduce `VECTOR_IVFFLAT_LISTS` by 25% iteratively (not dropping below 50) before giving up.
+
+If you see a memory error:
+1. Increase `VECTOR_MAINTENANCE_WORK_MEM_MB` (and possibly the MAX) OR reduce `VECTOR_IVFFLAT_LISTS`.
+2. Ensure the underlying Postgres container allows that value (the session `SET` can fail if global limits are lower).
+3. Re-run the init container (data reload is skipped; only index build runs). If the index already partially exists, you may need to `DROP INDEX layer_embedding_index;` first.
+
+Example fast recall (higher memory):
+```
+VECTOR_IVFFLAT_LISTS=1800
+VECTOR_MAINTENANCE_WORK_MEM_MB=1024
+VECTOR_MAINTENANCE_WORK_MEM_MAX_MB=2048
+```
+Memory conservation build:
+```
+VECTOR_IVFFLAT_LISTS=400
+VECTOR_MAINTENANCE_WORK_MEM_MB=256
+```
 
 Example query (L2 distance):
 ```
@@ -146,7 +166,7 @@ Data & table:
 - `GEOPARQUET_PATH`, `POSTGRES_SCHEMA`, `POSTGRES_TABLE`, `PGVECTOR_DIM`
 
 Vector indexing:
-- `VECTOR_INDEX_TYPE`, `VECTOR_METRIC`, `VECTOR_INDEX_NAME`, `VECTOR_IVFFLAT_LISTS`, `VECTOR_HNSW_M`, `VECTOR_HNSW_EF_CONSTRUCTION`
+- `VECTOR_INDEX_TYPE`, `VECTOR_METRIC`, `VECTOR_INDEX_NAME`, `VECTOR_IVFFLAT_LISTS`, `VECTOR_HNSW_M`, `VECTOR_HNSW_EF_CONSTRUCTION`, `VECTOR_MAINTENANCE_WORK_MEM_MB`, `VECTOR_MAINTENANCE_WORK_MEM_MAX_MB`, `VECTOR_AUTOTUNE_INDEX_MEMORY`
 
 Loader performance & method:
 - `LOADER_METHOD`, `INIT_LOADER_BATCH_SIZE` (executemany only), `LOADER_COMMIT_INTERVAL` (executemany only), `LOADER_PERFORMANCE_TWEAKS`, `LOADER_WORK_MEM`, `LOADER_TEMP_BUFFERS`, `LOADER_SYNCHRONOUS_COMMIT`

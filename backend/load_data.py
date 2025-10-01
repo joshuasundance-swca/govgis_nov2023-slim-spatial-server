@@ -74,6 +74,13 @@ def check_env_vars() -> None:
         "LOADER_SYNCHRONOUS_COMMIT": "off",
         # Loader method: copy (default) or executemany
         "LOADER_METHOD": "copy",
+        # New vector index memory tuning
+        # Initial maintenance_work_mem to request for index build (MB)
+        "VECTOR_MAINTENANCE_WORK_MEM_MB": "512",
+        # Allow one retry raising maintenance_work_mem up to this cap if memory error encountered
+        "VECTOR_MAINTENANCE_WORK_MEM_MAX_MB": "2048",
+        # Enable automatic retry if memory error indicates higher requirement
+        "VECTOR_AUTOTUNE_INDEX_MEMORY": "true",
     }
 
     for env_var in required_env_vars:
@@ -132,6 +139,23 @@ def check_env_vars() -> None:
     if loader_method not in {"copy", "executemany"}:
         raise ValueError("LOADER_METHOD must be 'copy' or 'executemany'")
     os.environ["LOADER_METHOD"] = loader_method
+
+    # maintenance work mem numbers
+    base_mem = os.environ.get("VECTOR_MAINTENANCE_WORK_MEM_MB", "512")
+    max_mem = os.environ.get("VECTOR_MAINTENANCE_WORK_MEM_MAX_MB", "2048")
+    if not (base_mem.isdigit() and int(base_mem) > 0):
+        raise ValueError("VECTOR_MAINTENANCE_WORK_MEM_MB must be positive integer (MB)")
+    if not (max_mem.isdigit() and int(max_mem) >= int(base_mem)):
+        raise ValueError(
+            "VECTOR_MAINTENANCE_WORK_MEM_MAX_MB must be >= base mem and positive integer",
+        )
+    # store normalized
+    os.environ["VECTOR_MAINTENANCE_WORK_MEM_MB"] = base_mem
+    os.environ["VECTOR_MAINTENANCE_WORK_MEM_MAX_MB"] = max_mem
+    auto_tune = os.environ.get("VECTOR_AUTOTUNE_INDEX_MEMORY", "true").lower()
+    if auto_tune not in {"true", "false"}:
+        raise ValueError("VECTOR_AUTOTUNE_INDEX_MEMORY must be true or false")
+    os.environ["VECTOR_AUTOTUNE_INDEX_MEMORY"] = auto_tune
 
 
 def check_geoparquet_path() -> None:
@@ -221,47 +245,142 @@ async def make_vector_index(conn: AsyncConnection) -> None:
     index_ident = sql.Identifier(os.environ["VECTOR_INDEX_NAME"])
     ops_class = os.environ["_VECTOR_OPS_CLASS"]  # already validated mapping
     index_type = os.environ["VECTOR_INDEX_TYPE"]
-
-    if index_type == "ivfflat":
-        lists = int(os.environ["VECTOR_IVFFLAT_LISTS"])
-        ddl = sql.SQL(
-            "CREATE INDEX IF NOT EXISTS {index} ON {table} USING ivfflat (embeddings {ops}) WITH (lists = {lists})",
-        ).format(
-            index=index_ident,
-            table=table_ident,
-            ops=sql.SQL(ops_class),
-            lists=sql.Literal(lists),
-        )
-    else:  # hnsw
-        m_val = int(os.environ["VECTOR_HNSW_M"])
-        efc = int(os.environ["VECTOR_HNSW_EF_CONSTRUCTION"])
-        ddl = sql.SQL(
-            "CREATE INDEX IF NOT EXISTS {index} ON {table} USING hnsw (embeddings {ops}) WITH (m = {m}, ef_construction = {efc})",
-        ).format(
-            index=index_ident,
-            table=table_ident,
-            ops=sql.SQL(ops_class),
-            m=sql.Literal(m_val),
-            efc=sql.Literal(efc),
-        )
+    autotune = os.environ.get("VECTOR_AUTOTUNE_INDEX_MEMORY", "true") == "true"
+    base_mem_mb = int(os.environ.get("VECTOR_MAINTENANCE_WORK_MEM_MB", "512"))
+    max_mem_mb = int(os.environ.get("VECTOR_MAINTENANCE_WORK_MEM_MAX_MB", "2048"))
 
     async with conn.cursor() as cur:
-        try:
-            await cur.execute(ddl)
-            # ANALYZE recommended especially for ivfflat to collect stats for planner
-            await cur.execute(sql.SQL("ANALYZE {table}").format(table=table_ident))
-            logging.info(
-                "Vector index ensured (type=%s, metric=%s, name=%s)",
-                index_type,
-                os.environ["VECTOR_METRIC"],
-                os.environ["VECTOR_INDEX_NAME"],
-            )
-        except Exception as e:  # pragma: no cover (environment specific)
-            logging.warning(
-                "Vector index creation failed (type=%s). Continuing without it: %s",
-                index_type,
-                e,
-            )
+        # Set initial maintenance_work_mem for index build (best-effort)
+        if index_type == "ivfflat":
+            try:
+                await cur.execute(
+                    sql.SQL("SET maintenance_work_mem TO {}MB").format(
+                        sql.SQL(str(base_mem_mb)),
+                    ),
+                )
+                logging.info(
+                    "Set maintenance_work_mem to %sMB for vector index build",
+                    base_mem_mb,
+                )
+            except Exception as e:  # pragma: no cover
+                logging.info(
+                    "Could not set maintenance_work_mem (%sMB): %s",
+                    base_mem_mb,
+                    e,
+                )
+
+        def build_stmt(lists_val: int | None = None):
+            if index_type == "ivfflat":
+                lists_local = (
+                    lists_val
+                    if lists_val is not None
+                    else int(os.environ["VECTOR_IVFFLAT_LISTS"])
+                )
+                return sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {index} ON {table} USING ivfflat (embeddings {ops}) WITH (lists = {lists})",
+                ).format(
+                    index=index_ident,
+                    table=table_ident,
+                    ops=sql.SQL(ops_class),
+                    lists=sql.Literal(lists_local),
+                )
+            else:
+                m_val = int(os.environ["VECTOR_HNSW_M"])
+                efc = int(os.environ["VECTOR_HNSW_EF_CONSTRUCTION"])
+                return sql.SQL(
+                    "CREATE INDEX IF NOT EXISTS {index} ON {table} USING hnsw (embeddings {ops}) WITH (m = {m}, ef_construction = {efc})",
+                ).format(
+                    index=index_ident,
+                    table=table_ident,
+                    ops=sql.SQL(ops_class),
+                    m=sql.Literal(m_val),
+                    efc=sql.Literal(efc),
+                )
+
+        current_lists = (
+            int(os.environ.get("VECTOR_IVFFLAT_LISTS", "100"))
+            if index_type == "ivfflat"
+            else None
+        )
+        tried_raise_mem = False
+        while True:
+            ddl = build_stmt(current_lists)
+            try:
+                await cur.execute(ddl)
+                await cur.execute(sql.SQL("ANALYZE {table}").format(table=table_ident))
+                logging.info(
+                    "Vector index ensured (type=%s, metric=%s, name=%s, lists=%s)",
+                    index_type,
+                    os.environ["VECTOR_METRIC"],
+                    os.environ["VECTOR_INDEX_NAME"],
+                    current_lists if current_lists is not None else "-",
+                )
+                break
+            except Exception as e:  # pragma: no cover
+                msg = str(e)
+                if (
+                    index_type == "ivfflat"
+                    and autotune
+                    and "memory required is" in msg
+                    and "maintenance_work_mem" in msg
+                ):
+                    # Parse required and current memory from error
+                    m = re.search(
+                        r"memory required is (\d+) MB, maintenance_work_mem is (\d+) MB",
+                        msg,
+                    )
+                    if m:
+                        required_mb = int(m.group(1))
+                        current_mb = int(m.group(2))
+                        logging.warning(
+                            "Vector index build requires %sMB (current maintenance_work_mem=%sMB)",
+                            required_mb,
+                            current_mb,
+                        )
+                        # Try raising maintenance_work_mem once if not yet and within cap
+                        if not tried_raise_mem and required_mb <= max_mem_mb:
+                            try:
+                                await cur.execute(
+                                    sql.SQL("SET maintenance_work_mem TO {}MB").format(
+                                        sql.SQL(str(required_mb)),
+                                    ),
+                                )
+                                tried_raise_mem = True
+                                logging.info(
+                                    "Raised maintenance_work_mem to %sMB; retrying index build (lists=%s)",
+                                    required_mb,
+                                    current_lists,
+                                )
+                                continue
+                            except Exception as se:
+                                logging.info(
+                                    "Failed to raise maintenance_work_mem to %sMB: %s",
+                                    required_mb,
+                                    se,
+                                )
+                        # If cannot raise memory, attempt to reduce lists heuristically
+                        if current_lists and current_lists > 50:
+                            new_lists = max(50, int(current_lists * 0.75))
+                            if new_lists < current_lists:
+                                logging.warning(
+                                    "Reducing ivfflat lists from %s to %s and retrying due to memory pressure",
+                                    current_lists,
+                                    new_lists,
+                                )
+                                current_lists = new_lists
+                                continue
+                    logging.warning(
+                        "Vector index creation failed after autotune attempts; proceeding without vector index: %s",
+                        e,
+                    )
+                    break
+                else:
+                    logging.warning(
+                        "Vector index creation failed (type=%s). Continuing without it: %s",
+                        index_type,
+                        e,
+                    )
+                    break
 
 
 make_user_sql = """CREATE ROLE {read_only_user} WITH LOGIN PASSWORD '{read_only_user_password}';
