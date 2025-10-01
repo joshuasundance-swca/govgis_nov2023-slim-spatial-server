@@ -1,12 +1,12 @@
 import asyncio
 import logging
 import os
-from typing import Iterable
-from asyncpg.connection import Connection
-import asyncpg
+from typing import Iterable, Tuple
+
 import geopandas as gpd
 import shapely.wkb
-from pgvector.asyncpg import register_vector
+import psycopg
+from psycopg import AsyncConnection
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +23,8 @@ table_columns = [
     "embeddings",
     "geom",
 ]
+
+BATCH_SIZE = 500
 
 
 def check_env_vars() -> None:
@@ -43,12 +45,10 @@ def check_env_vars() -> None:
         "SPATIAL_INDEX_NAME": "layer_extent_index",
     }
 
-    # Check required environment variables
     for env_var in required_env_vars:
         if not os.environ.get(env_var):
             raise ValueError(f"{env_var} environment variable must be set")
 
-    # Check optional environment variables and set defaults if not present
     for env_var, default_value in optional_env_vars_with_defaults.items():
         if not os.environ.get(env_var):
             os.environ[env_var] = default_value
@@ -81,22 +81,27 @@ CREATE TABLE IF NOT EXISTS {table}
 TABLESPACE pg_default;"""
 
 
-async def make_table(conn: Connection) -> None:
+async def make_table(conn: AsyncConnection) -> None:
     """Create the table if it doesn't already exist"""
-    await conn.execute(make_table_sql.format(table=os.environ["POSTGRES_TABLE"]))
+    async with conn.cursor() as cur:
+        await cur.execute(make_table_sql.format(table=os.environ["POSTGRES_TABLE"]))
 
 
 make_index_sql = """CREATE INDEX IF NOT EXISTS {index_name}
-    ON layers USING gist
+    ON {table} USING gist
     (geom)
     TABLESPACE pg_default;"""
 
 
-async def make_index(conn: Connection) -> None:
+async def make_index(conn: AsyncConnection) -> None:
     """Create the spatial index if it doesn't already exist"""
-    await conn.execute(
-        make_index_sql.format(index_name=os.environ["SPATIAL_INDEX_NAME"]),
-    )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            make_index_sql.format(
+                index_name=os.environ["SPATIAL_INDEX_NAME"],
+                table=os.environ["POSTGRES_TABLE"],
+            ),
+        )
 
 
 make_user_sql = """CREATE ROLE {read_only_user} WITH LOGIN PASSWORD '{read_only_user_password}';
@@ -106,9 +111,7 @@ REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {schema} FROM {read_only_user};
 GRANT SELECT ON {table} TO {read_only_user};"""
 
 
-async def make_user(
-    conn: Connection,
-) -> None:
+async def make_user(conn: AsyncConnection) -> None:
     """Create the user if it doesn't already exist"""
     user_kwargs = {
         "read_only_user": os.environ["READ_ONLY_POSTGRES_USER"],
@@ -124,70 +127,100 @@ async def make_user(
         else:
             logging.info(f"{k} = {v}")
 
-    await conn.execute(make_user_sql.format(**user_kwargs))
+    async with conn.cursor() as cur:
+        try:
+            await cur.execute(make_user_sql.format(**user_kwargs))
+        except Exception as e:
+            # Likely role exists; log and continue
+            logging.info(f"User creation skipped or partially applied: {e}")
 
 
-async def check_table_length(conn: Connection) -> bool:
+async def check_table_length(conn: AsyncConnection) -> bool:
     """Check if the table is empty"""
-    count = await conn.fetchval(
-        f"SELECT COUNT(*) FROM {os.environ['POSTGRES_TABLE']}",  # nosec
-    )
+    async with conn.cursor() as cur:
+        await cur.execute(
+            f"SELECT COUNT(*) FROM {os.environ['POSTGRES_TABLE']}",  # nosec
+        )
+        row = await cur.fetchone()
+    count = row[0] if row else 0
     logging.info(f"Table has {count} rows")
     return count == 0
 
 
-async def get_connection() -> Connection:
-    """Get a connection to the database"""
-    conn = await asyncpg.connect(
+async def get_connection() -> AsyncConnection:
+    """Get an async psycopg connection to the database"""
+    conn = await psycopg.AsyncConnection.connect(
+        host=os.environ["POSTGRES_HOST"],
         user=os.environ["POSTGRES_USER"],
         password=os.environ["POSTGRES_PASSWORD"],
-        host=os.environ["POSTGRES_HOST"],
-        database=os.environ["POSTGRES_DB"],
+        dbname=os.environ["POSTGRES_DB"],
     )
-
-    # prepare connection for vectors
-    await register_vector(conn)
-
-    # prepare connection for geometries
-    def encode_geometry(geometry):
-        if not hasattr(geometry, "__geo_interface__"):
-            raise TypeError(
-                "{g} does not conform to " "the geo interface".format(g=geometry),
-            )
-        shape = shapely.geometry.shape(geometry)
-        return shapely.wkb.dumps(shape)
-
-    def decode_geometry(wkb):
-        return shapely.wkb.loads(wkb)
-
-    await conn.set_type_codec(
-        "geometry",
-        encoder=encode_geometry,
-        decoder=decode_geometry,
-        format="binary",
-    )
-
     return conn
 
 
-def data_generator() -> Iterable[tuple[str, str, str, str, str, str, str, str]]:
-    """Generate data to be inserted into the database"""
-    return (
+def vector_literal(val) -> str:
+    if isinstance(val, str):  # already a literal
+        return val
+    if isinstance(val, (list, tuple)):
+        return "[" + ",".join(format(float(x), "g") for x in val) + "]"
+    raise TypeError("Unsupported embedding value type for vector literal")
+
+
+def record_generator() -> Iterable[Tuple[str, str, str, str, str, str, str, bytes]]:
+    """Generate transformed records ready for insertion.
+
+    Embeddings are converted to pgvector literals; geom converted to WKB bytes.
+    """
+    gdf = (
         gpd.read_parquet(os.environ["GEOPARQUET_PATH"])
         .drop_duplicates(subset=["id", "metadata_text"])
-        .rename(columns={"geometry": "geom"})[table_columns]
-        .itertuples(index=False)
+        .rename(columns={"geometry": "geom"})
     )
-
-
-async def load_data(conn: Connection) -> None:
-    """Load data into the database"""
-    async with conn.transaction():
-        await conn.copy_records_to_table(
-            "layers",
-            records=data_generator(),
-            columns=table_columns,
+    for row in gdf.itertuples(index=False):
+        # row order matches table_columns
+        (id_, name, type_, description, url, metadata_text, embeddings, geom) = row
+        emb_lit = vector_literal(embeddings)
+        geom_wkb = shapely.wkb.dumps(geom)
+        yield (
+            id_,
+            name,
+            type_,
+            description,
+            url,
+            metadata_text,
+            emb_lit,
+            geom_wkb,
         )
+
+
+def batched(iterable: Iterable, size: int):
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) == size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+INSERT_SQL = (
+    "INSERT INTO {table} (id,name,type,description,url,metadata_text,embeddings,geom) "
+    "VALUES (%s,%s,%s,%s,%s,%s,%s::vector,ST_GeomFromWKB(%s,4326))"
+)
+
+
+async def load_data(conn: AsyncConnection) -> None:
+    """Load data into the database using batched executemany."""
+    sql = INSERT_SQL.format(table=os.environ["POSTGRES_TABLE"])
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            total = 0
+            for chunk in batched(record_generator(), BATCH_SIZE):
+                await cur.executemany(sql, chunk)
+                total += len(chunk)
+                logging.info(f"Inserted {total} records ...")
+    logging.info("Data load complete")
 
 
 async def amain() -> None:
@@ -197,7 +230,7 @@ async def amain() -> None:
     conn = await get_connection()
     logging.info("Connected to database")
 
-    logging.info("Checking table")
+    logging.info("Checking / creating table")
     await make_table(conn)
 
     len_zero = await check_table_length(conn)

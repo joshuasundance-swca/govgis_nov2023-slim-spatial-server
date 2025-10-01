@@ -4,21 +4,14 @@ import os
 import re
 from typing import Optional, Tuple, List
 
-# from pyproj.exceptions import CRSError
-# from shapely.errors import GEOSException
-# from shapely.geometry import Polygon
 from pydantic import BaseModel, field_validator, model_validator, Field
 from pyproj import (
-    #    CRS,
     Proj,
     Transformer,
 )
 from sqlalchemy.sql import quoted_name  # added for safe identifier quoting
 
 from load_data import table_columns
-
-# import asyncpg
-# from asyncpg.connection import Connection
 
 MINIMUM_SEARCH_LIMIT = 1
 DEFAULT_SEARCH_LIMIT = 5
@@ -64,7 +57,6 @@ class Point4326(Point):
         return v
 
 
-# NOTE: kept for reference; no longer used directly with formatting + user inputs.
 SemanticSearchSQL = """SELECT {output_columns} FROM {table}
 {filter}
 ORDER BY embeddings <=> '{embeddings}'
@@ -103,30 +95,20 @@ class SemanticSearchRequest(BaseModel):
 
     @staticmethod
     def transform_emb(emb: list[float]) -> str:
-        # Produce a pgvector-compatible literal. Values are numeric so safe to join.
         return "[" + ",".join(format(x, "g") for x in emb) + "]"
 
     def embed_query(self, embedding_model) -> str:
-        # Return the vector literal string; parameterized later and cast to vector.
         return self.transform_emb(embedding_model.embed_query(self.request_string))
 
-    # --- Secure query builder ---
     def build_query(self, embedding_model) -> Tuple[str, List]:
-        """Build a parameterized SQL query and its parameters.
+        """Build a parameterized SQL query ensuring parameter order matches placeholders.
 
-        Returns
-        -------
-        (query, params):
-            query: A SQL string with positional parameters ($1, $2, ...).
-            params: List of parameter values matching placeholders.
-
-        Security considerations:
-            * All user-controlled scalar/list values are bound as parameters.
-            * Identifiers (table, columns) are validated and safely quoted.
-            * Embedding similarity uses a parameterized pgvector literal string.
-            * Geometry and type filters fully parameterized.
+        Placeholder order in final SQL:
+          1..N : optional filter params (type array, lon, lat)
+          Next : embedding vector literal for ORDER BY
+          Next : LIMIT
+          Next : OFFSET
         """
-        # Validate and fetch table name from environment (defense-in-depth)
         try:
             table_name = os.environ["POSTGRES_TABLE"]
         except KeyError as e:
@@ -135,59 +117,50 @@ class SemanticSearchRequest(BaseModel):
         if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", table_name):
             raise ValueError("Invalid table name (fails identifier whitelist)")
 
-        # Validate output columns (defense-in-depth; table_columns should be trusted but verify)
         unsafe_cols = [
             c for c in TEXT_FIELDS if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", c)
         ]
         if unsafe_cols:
             raise ValueError(f"Invalid column names detected: {unsafe_cols}")
 
-        # Use SQLAlchemy quoted_name to ensure safe quoting of identifiers.
         quoted_cols = [quoted_name(c, quote=True) for c in TEXT_FIELDS]
         output_columns = ",".join(f'"{c}"' for c in quoted_cols)
         quoted_table = f'"{quoted_name(table_name, quote=True)}"'
 
         params: List = []
+        filter_clauses: List[str] = []
 
-        # 1. Embedding vector literal string param ($1)
-        emb_literal = self.embed_query(embedding_model)
-        params.append(emb_literal)
-
-        filter_clauses = []
-
-        # 2. Type filter (array param ANY($n))
+        # Collect filter params first so their placeholders appear first.
         if self.type_filter:
             lowered_types = [t.lower() for t in self.type_filter if t]
             if lowered_types:
                 params.append(lowered_types)
-                # Cast param to text[] explicitly for clarity / inference
-                filter_clauses.append(f'LOWER("type") = ANY(${len(params)}::text[])')
+                filter_clauses.append('LOWER("type") = ANY(%s)')
 
-        # 3. Geometry filter (lon / lat params) (geom column quoted)
         if self.input_point is not None:
             params.append(self.input_point.longitude)
-            lon_idx = len(params)
             params.append(self.input_point.latitude)
-            lat_idx = len(params)
             filter_clauses.append(
-                f'ST_Intersects("geom", ST_SetSRID(ST_MakePoint(${lon_idx}, ${lat_idx}), 4326))',
+                'ST_Intersects("geom", ST_SetSRID(ST_MakePoint(%s, %s), 4326))',
             )
 
         where_sql = ""
         if filter_clauses:
             where_sql = "WHERE " + " AND ".join(filter_clauses)
 
-        # 4. LIMIT + 5. OFFSET
+        # Embedding param now appended AFTER filters so its placeholder is next.
+        emb_literal = self.embed_query(embedding_model)
+        params.append(emb_literal)
+
+        # LIMIT and OFFSET last.
         params.append(self.limit)
-        limit_idx = len(params)
         params.append(self.skip)
-        offset_idx = len(params)
 
         query = (
             f"SELECT {output_columns} FROM {quoted_table} "  # nosec
             f"{where_sql} "
-            f'ORDER BY "embeddings" <=> $1::vector '
-            f"LIMIT ${limit_idx} OFFSET ${offset_idx}"
+            f'ORDER BY "embeddings" <=> %s::vector '
+            f"LIMIT %s OFFSET %s"
         )
 
         return query, params

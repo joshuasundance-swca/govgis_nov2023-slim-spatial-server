@@ -12,7 +12,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: base
+      target: init
     env_file:
       - .env
     volumes:
@@ -28,7 +28,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: base
+      target: emb
     env_file:
       - .env
     volumes:

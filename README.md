@@ -15,12 +15,17 @@
 
 🤖 This README was written by GPT-4. 🤖
 
+## UPDATES (10/01/2025)
+- Migrated asyncpg & psycopg2 to psycopg3 (async) using AsyncConnectionPool
+- Implemented pooled connections for FastAPI lifespan
+- Rewrote data loader to use batched psycopg async executemany with pgvector + PostGIS
+- Removed custom asyncpg codecs and copy logic; simplified vector + geometry insertion
+
 ## UPDATES (09/30/2025)
 - moved from python 3.11 to python 3.13
 - added an mcp server with `fastmcp`
-- [agent.ipynb](./agent.ipynb) shows the use of `deepagents` with the mcp server
-- `TODO`: remove asyncpg dependency and use psycopg3
-
+- `agent.ipynb` shows the use of `deepagents` with the mcp server
+- (Completed) remove asyncpg dependency and use psycopg3
 
 ## Introduction
 
