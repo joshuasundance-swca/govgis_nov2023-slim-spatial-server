@@ -6,7 +6,7 @@ from models import SemanticSearchRequest, SearchResponse  # type: ignore[attr-de
 
 mcp = FastMCP(name="govgis_nov2023")
 
-client = AsyncClient(base_url="http://backend:8080")
+client = AsyncClient(base_url="http://backend:8080", timeout=60)
 
 
 def markdownify_all_strings(obj):
