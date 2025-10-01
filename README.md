@@ -19,7 +19,7 @@
 # UPDATE: moved from python 3.11 to python 3.13
 # TODO: remove asyncpg dependency and use psycopg3
 
-# UPDATE: `agent.ipynb` shows the use of `deepagents` with the mcp server
+# UPDATE: [./agent.ipynb](`agent.ipynb`) shows the use of `deepagents` with the mcp server
 
 ## Introduction
 
