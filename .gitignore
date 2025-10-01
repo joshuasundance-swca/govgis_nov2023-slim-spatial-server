@@ -1,3 +1,5 @@
+pgadmin_data/
+pgdata/
 govgis-nov2023/
 models/
 *$py.class
