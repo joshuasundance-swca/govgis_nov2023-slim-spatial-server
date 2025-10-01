@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import time
 import os
 import re
 from typing import Optional, Tuple, List
@@ -12,7 +12,9 @@ from pyproj import (
 from sqlalchemy.sql import quoted_name  # added for safe identifier quoting
 
 from load_data import table_columns
+import logging
 
+logger = logging.getLogger(__name__)
 MINIMUM_SEARCH_LIMIT = 1
 DEFAULT_SEARCH_LIMIT = 5
 MAXIMUM_SEARCH_LIMIT = 10
@@ -85,6 +87,10 @@ class SemanticSearchRequest(BaseModel):
         ge=MINIMUM_SEARCH_LIMIT,
         le=MAXIMUM_SEARCH_LIMIT,
     )
+    timeout: int | None = Field(
+        60,
+        description="The timeout for the request in seconds",
+    )
 
     @field_validator("input_point")
     @classmethod
@@ -97,10 +103,14 @@ class SemanticSearchRequest(BaseModel):
     def transform_emb(emb: list[float]) -> str:
         return "[" + ",".join(format(x, "g") for x in emb) + "]"
 
-    def embed_query(self, embedding_model) -> str:
-        return self.transform_emb(embedding_model.embed_query(self.request_string))
+    async def embed_query(self, embedding_model) -> str:
+        start_time = time.time()
+        _emb = await embedding_model.aembed_query(self.request_string)
+        elapsed_time = time.time() - start_time
+        logger.info(f"Embedding generation took {elapsed_time:.2f} seconds")
+        return self.transform_emb(_emb)
 
-    def build_query(self, embedding_model) -> Tuple[str, List]:
+    async def build_query(self, embedding_model) -> Tuple[str, List]:
         """Build a parameterized SQL query ensuring parameter order matches placeholders.
 
         Placeholder order in final SQL:
@@ -149,7 +159,7 @@ class SemanticSearchRequest(BaseModel):
             where_sql = "WHERE " + " AND ".join(filter_clauses)
 
         # Embedding param now appended AFTER filters so its placeholder is next.
-        emb_literal = self.embed_query(embedding_model)
+        emb_literal = await self.embed_query(embedding_model)
         params.append(emb_literal)
 
         # LIMIT and OFFSET last.

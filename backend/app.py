@@ -2,6 +2,8 @@ import os
 from contextlib import asynccontextmanager
 import re
 import logging
+import asyncio
+import time
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -22,6 +24,20 @@ __version__ = "0.0.1"
 # Initialize a global async connection pool (opened in FastAPI lifespan)
 pool: AsyncConnectionPool | None = None
 logger = logging.getLogger(__name__)
+
+
+def configure_logging() -> None:
+    """Configure root logging once using LOG_LEVEL env (default INFO)."""
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    if not logging.getLogger().handlers:  # basicConfig is no-op if already configured
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+    else:
+        logging.getLogger().setLevel(level)
+    logger.info("Logging configured level=%s", level_name)
 
 
 def _safe_identifier(name: str) -> str:
@@ -133,11 +149,44 @@ async def ensure_read_only_user() -> None:
         logger.error("Unable to verify read-only user after creation/update: %s", e)
 
 
+async def _warm_pool(target: int) -> None:
+    """Eagerly create and validate connections up to *target*.
+
+    This issues lightweight 'SELECT 1' on each new connection so that later
+    request latency isn't impacted by connection creation or initial DB auth.
+    """
+    if pool is None:
+        return
+    created = 0
+    while created < target:
+        async with pool.connection() as conn:  # creates new one if below max_size
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1")
+                await cur.fetchone()
+        created += 1
+    logger.info("Pool warm complete: %s connections validated", created)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # FastAPI will call this on startup/shutdown
     global pool
-    # Ensure user exists before opening pool (self-heals older deployments)
+    configure_logging()
     await ensure_read_only_user()
+
+    max_size = int(os.getenv("PG_POOL_MAX_SIZE", "10"))
+    configured_min = int(os.getenv("PG_POOL_MIN_SIZE", "1"))
+    eager = os.getenv("PG_POOL_EAGER", "false").lower() in {"1", "true", "yes", "on"}
+    min_size = max_size if eager else min(configured_min, max_size)
+
+    warm_target_env = os.getenv("PG_POOL_WARM_TARGET")
+    warm_target = 0
+    if warm_target_env and warm_target_env.isdigit():
+        warm_target = int(warm_target_env)
+
+    pool_timeout = float(
+        os.getenv("PG_POOL_TIMEOUT", "30"),
+    )  # seconds to wait for a free conn
+
     pool = AsyncConnectionPool(
         conninfo=(
             f"host={os.environ['POSTGRES_HOST']} "
@@ -145,11 +194,46 @@ async def lifespan(app: FastAPI):  # FastAPI will call this on startup/shutdown
             f"password={os.environ['READ_ONLY_POSTGRES_USER_PASSWORD']} "
             f"dbname={os.environ['POSTGRES_DB']}"
         ),
-        min_size=1,
-        max_size=10,
-        open=False,
+        min_size=min_size,
+        max_size=max_size,
+        timeout=pool_timeout,
+        open=False,  # we'll open explicitly (avoid double-open)
     )
     await pool.open()
+    logger.info(
+        "Pool initialized min=%s max=%s eager=%s timeout=%s warm_target=%s",
+        min_size,
+        max_size,
+        eager,
+        pool_timeout,
+        warm_target,
+    )
+
+    # Eager mode warms entire pool; otherwise optional partial warm target.
+    if eager:
+        try:
+            await _warm_pool(max_size)
+        except Exception as e:  # pragma: no cover
+            logger.warning("Pool warm (eager) failed: %s", e)
+        if warm_target:
+            logger.info(
+                "PG_POOL_WARM_TARGET=%s ignored because PG_POOL_EAGER is true",
+                warm_target,
+            )
+    elif warm_target > 0:
+        try:
+            await _warm_pool(min(warm_target, max_size))
+        except Exception as e:  # pragma: no cover
+            logger.warning("Partial pool warm failed: %s", e)
+
+    if os.getenv("EMBEDDING_WARMUP", "true").lower() in {"1", "true", "yes", "on"}:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _embedding_model.embed_query, "warmup")
+            logger.info("Embedding model warm-up complete")
+        except Exception as e:  # pragma: no cover
+            logger.warning("Embedding warm-up skipped/failed: %s", e)
+
     try:
         yield
     finally:
@@ -166,8 +250,11 @@ app = FastAPI(
 
 async def get_connection():
     """FastAPI dependency yielding a pooled async psycopg connection."""
+    start_time = time.time()
     assert pool is not None, "Connection pool not initialized"  # nosec
     async with pool.connection() as conn:  # connection returned to pool automatically
+        elapsed_time = time.time() - start_time
+        logger.info("Connection checkout took %.2f seconds", elapsed_time)
         yield conn
 
 
@@ -189,16 +276,56 @@ async def search(
     conn=Depends(get_connection),
     embedding_model=Depends(get_embedding_model),
 ) -> SearchResponse:
-    query, params = request.build_query(embedding_model)
-    print("Executing semantic search query with", len(params), "parameters")  # debug
+    start = time.perf_counter()
+    query, params = await request.build_query(embedding_model)
+    logger.debug("search start params=%d", len(params))
     try:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(query, params)
             rows = await cur.fetchall()
-    except Exception as e:  # broad catch to surface error in response model
-        print("Search error:", e)
+    except Exception as e:
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.error(
+            "search error params=%d duration_ms=%.2f error=%s",
+            len(params),
+            duration_ms,
+            e,
+        )
         return SearchResponse(layers=None, error=str(e))
+    duration_ms = (time.perf_counter() - start) * 1000
+    logger.info(
+        "search ok rows=%d params=%d duration_ms=%.2f",
+        len(rows),
+        len(params),
+        duration_ms,
+    )
     return SearchResponse(
         layers=[LayerResult.model_validate(dict(r)) for r in rows],
         error=None,
     )
+
+
+@app.get("/health")
+async def health():
+    """Lightweight health check.
+
+    Returns basic pool sizing info (without forcing any new connections) and static status.
+    Safe for readiness / liveness probes and latency benchmarking.
+    """
+    initialized = pool is not None
+    data: dict[str, object] = {
+        "status": "ok",
+        "version": __version__,
+        "pool_initialized": initialized,
+    }
+    if initialized:
+        try:  # Access attributes defensively
+            data.update(
+                {
+                    "pool_min_size": pool.min_size,  # type: ignore[union-attr]
+                    "pool_max_size": pool.max_size,  # type: ignore[union-attr]
+                },
+            )
+        except Exception:  # pragma: no cover  # nosec
+            pass
+    return data

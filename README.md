@@ -20,6 +20,7 @@
 - Implemented pooled connections for FastAPI lifespan
 - Rewrote data loader to use batched psycopg async executemany with pgvector + PostGIS
 - Removed custom asyncpg codecs and copy logic; simplified vector + geometry insertion
+- Added configurable eager pool warm-up + partial warm targeting and embedding model warm-up (see "Performance & Pooling")
 
 ## UPDATES (09/30/2025)
 - moved from python 3.11 to python 3.13
@@ -61,6 +62,67 @@ The `postgres-init` service is responsible for loading data into the database. I
 
 Download [the dataset](https://huggingface.co/datasets/joshuasundance/govgis_nov2023-slim-spatial/blob/main/govgis_nov2023_slim_spatial_embs.geoparquet) and
 place it in `./govgis-nov2023` (according to the `docker-compose.yml` volume mapping).
+
+## Performance & Pooling
+
+To minimize first-request latency and control connection behavior, several environment variables are available:
+
+Core variables (existing):
+- `POSTGRES_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: Superuser / bootstrap credentials.
+- `READ_ONLY_POSTGRES_USER`, `READ_ONLY_POSTGRES_USER_PASSWORD`: A read-only role is auto-created / updated on startup if needed.
+- `POSTGRES_SCHEMA` (default `public`), `POSTGRES_TABLE` (default `layers`).
+
+Pooling / warm-up variables (new):
+- `PG_POOL_MAX_SIZE` (default `10`): Upper bound of concurrent DB connections in the async pool.
+- `PG_POOL_MIN_SIZE` (default `1`): Minimum number of kept-open connections (ignored if eager mode is on).
+- `PG_POOL_EAGER` (default `false`): When true, sets `min_size = max_size` and warms all connections immediately.
+- `PG_POOL_WARM_TARGET` (optional int): If not eager, pre-initialize up to this many connections (capped by `PG_POOL_MAX_SIZE`).
+- `PG_POOL_TIMEOUT` (default `30` seconds): How long a request waits for a free connection before raising an error.
+- `EMBEDDING_WARMUP` (default `true`): Pre-computes a single embedding at startup so the model is JIT-loaded before traffic.
+
+Behavior precedence:
+1. If `PG_POOL_EAGER=true`, the pool will attempt to fully open and validate `PG_POOL_MAX_SIZE` connections; `PG_POOL_WARM_TARGET` is ignored.
+2. If `PG_POOL_EAGER=false` and `PG_POOL_WARM_TARGET` is set, that many connections are warmed (minimum of configured target and `PG_POOL_MAX_SIZE`).
+3. If neither eager nor warm target is set, only `PG_POOL_MIN_SIZE` connections are opened initially; additional are created lazily on demand.
+
+Recommended setups:
+- Local development (fast startup, ok with a small first-hit penalty):
+  - `PG_POOL_EAGER=false`, `PG_POOL_MIN_SIZE=1`, omit warm target.
+- Low-latency demo / production small instance (predictable concurrency < 10):
+  - `PG_POOL_EAGER=true`, adjust `PG_POOL_MAX_SIZE` to expected peak.
+- Burst traffic with moderate DB budget:
+  - `PG_POOL_EAGER=false`, `PG_POOL_WARM_TARGET=4` (or similar), `PG_POOL_MAX_SIZE=16` (connections above warm target are created lazily).
+
+Example docker-compose service override:
+```
+  backend:
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: govgis
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: example
+      READ_ONLY_POSTGRES_USER: ro
+      READ_ONLY_POSTGRES_USER_PASSWORD: ro_pw
+      PG_POOL_MAX_SIZE: "12"
+      PG_POOL_MIN_SIZE: "2"
+      PG_POOL_WARM_TARGET: "6"   # partial pre-warm
+      PG_POOL_TIMEOUT: "20"
+      EMBEDDING_WARMUP: "true"
+      # Set PG_POOL_EAGER: "true" to fully pre-warm all 12 connections instead
+```
+
+Windows CMD one-off run (fully eager):
+```
+set PG_POOL_EAGER=true
+set PG_POOL_MAX_SIZE=10
+set PG_POOL_MIN_SIZE=1
+set EMBEDDING_WARMUP=true
+uvicorn backend.app:app --host 0.0.0.0 --port 8000
+```
+
+Latency measurement tips:
+- First request cold latency: `curl -w "First byte: %{time_starttransfer}\n" -o NUL -s http://localhost:8000/docs`
+- Load test (example using `hey`): `hey -z 30s -c 10 http://localhost:8000/health` (add a lightweight health endpoint if desired).
 
 ## Customization
 
