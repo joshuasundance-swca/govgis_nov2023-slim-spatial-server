@@ -19,6 +19,8 @@
 # UPDATE: moved from python 3.11 to python 3.13
 # TODO: remove asyncpg dependency and use psycopg3
 
+# UPDATE: `agent.ipynb` shows the use of `deepagents` with the mcp server
+
 ## Introduction
 
 `govgis_nov2023-slim-spatial-server` is a Dockerized project combining `PostGIS` and `pgvector` extensions to process and serve a comprehensive geospatial dataset, `govgis_nov2023`. This project aims to provide a robust framework for efficient handling and querying of geospatial data along with high-dimensional vector similarity search capabilities, leveraging the power of PostgreSQL.
