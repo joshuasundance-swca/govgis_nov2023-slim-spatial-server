@@ -1,18 +1,17 @@
-asyncpg==0.29.0
-fastapi==0.109.2
-# torchvision==0.16.1+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html
-GeoAlchemy2==0.14.3
-geopandas==0.14.3
-gunicorn==21.2.0
-langchain==0.1.5
-pgvector==0.2.4
-psycopg2-binary==2.9.9
-pyarrow==15.0.0
-pydantic==2.6.0
-pyproj==3.6.1
-PyYAML==6.0.1
-sentence-transformers==2.3.1
-shapely==2.0.2
-SQLAlchemy==2.0.25
-torch==2.2.0 -f https://download.pytorch.org/whl/cpu/torch_stable.html
-uvicorn==0.27.0.post1
+asyncpg
+fastapi
+GeoAlchemy2
+geopandas
+gunicorn
+langchain
+pgvector
+psycopg2-binary
+pyarrow
+pydantic
+pyproj
+PyYAML
+sentence-transformers
+shapely
+SQLAlchemy
+torch>=2.2.0 -f https://download.pytorch.org/whl/cpu/torch_stable.html
+uvicorn
