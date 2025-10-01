@@ -16,6 +16,8 @@
 🤖 This README was written by GPT-4. 🤖
 
 # UPDATE: added an mcp server with `fastmcp`.
+# UPDATE: moved from python 3.11 to python 3.13
+# TODO: remove asyncpg dependency and use psycopg3
 
 ## Introduction
 
