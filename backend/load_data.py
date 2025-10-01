@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import psycopg
 import shapely.wkb
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
 
 logging.basicConfig(
     level=logging.INFO,
@@ -109,14 +109,26 @@ TABLESPACE pg_default;"""
 
 
 async def make_table(conn: AsyncConnection) -> None:
-    """Create the table if it doesn't already exist"""
+    """Create the table if it doesn't already exist (idempotent)."""
+    table_ident = sql.Identifier(os.environ["POSTGRES_TABLE"])  # validated earlier
+    dim_literal = sql.Literal(int(os.environ.get("PGVECTOR_DIM", "1024")))
+    create_table_stmt = sql.SQL(
+        """CREATE TABLE IF NOT EXISTS {table} (
+    id text,
+    name text,
+    type text,
+    description text,
+    url text,
+    metadata_text text,
+    embeddings vector({dim}),
+    geom geometry(Polygon,4326)
+) TABLESPACE pg_default;""",
+    ).format(table=table_ident, dim=dim_literal)
     async with conn.cursor() as cur:
-        await cur.execute(
-            make_table_sql.format(
-                table=os.environ["POSTGRES_TABLE"],
-                dim=os.environ.get("PGVECTOR_DIM", "1024"),
-            ),
-        )
+        # Extensions (no dynamic parts)
+        await cur.execute(sql.SQL("CREATE EXTENSION IF NOT EXISTS postgis"))
+        await cur.execute(sql.SQL("CREATE EXTENSION IF NOT EXISTS vector"))
+        await cur.execute(create_table_stmt)
 
 
 make_index_sql = """CREATE INDEX IF NOT EXISTS {index_name}
@@ -126,14 +138,14 @@ make_index_sql = """CREATE INDEX IF NOT EXISTS {index_name}
 
 
 async def make_index(conn: AsyncConnection) -> None:
-    """Create the spatial index if it doesn't already exist"""
+    """Create the spatial index if it doesn't already exist (idempotent)."""
+    index_ident = sql.Identifier(os.environ["SPATIAL_INDEX_NAME"])  # validated
+    table_ident = sql.Identifier(os.environ["POSTGRES_TABLE"])  # validated
+    create_index_stmt = sql.SQL(
+        "CREATE INDEX IF NOT EXISTS {index} ON {table} USING gist (geom) TABLESPACE pg_default",
+    ).format(index=index_ident, table=table_ident)
     async with conn.cursor() as cur:
-        await cur.execute(
-            make_index_sql.format(
-                index_name=os.environ["SPATIAL_INDEX_NAME"],
-                table=os.environ["POSTGRES_TABLE"],
-            ),
-        )
+        await cur.execute(create_index_stmt)
 
 
 make_user_sql = """CREATE ROLE {read_only_user} WITH LOGIN PASSWORD '{read_only_user_password}';
@@ -144,40 +156,54 @@ GRANT SELECT ON {table} TO {read_only_user};"""
 
 
 async def make_user(conn: AsyncConnection) -> None:
-    """Create the user if it doesn't already exist"""
-    user_kwargs = {
-        "read_only_user": os.environ["READ_ONLY_POSTGRES_USER"],
-        "read_only_user_password": os.environ[
-            "READ_ONLY_POSTGRES_USER_PASSWORD"
-        ].replace(
-            "'",
-            "''",
-        ),  # simple escape
-        "database": os.environ["POSTGRES_DB"],
-        "schema": os.environ["POSTGRES_SCHEMA"],
-        "table": os.environ["POSTGRES_TABLE"],
-    }
+    """Create (if missing) and grant read-only privileges to the configured user."""
+    user_ident = sql.Identifier(os.environ["READ_ONLY_POSTGRES_USER"])  # validated
+    pwd_literal = sql.Literal(
+        os.environ["READ_ONLY_POSTGRES_USER_PASSWORD"],
+    )  # literal for safe quoting
+    db_ident = sql.Identifier(os.environ["POSTGRES_DB"])  # database name
+    schema_ident = sql.Identifier(os.environ["POSTGRES_SCHEMA"])  # validated
+    table_ident = sql.Identifier(os.environ["POSTGRES_TABLE"])  # validated
 
-    for k, v in user_kwargs.items():
-        if k == "read_only_user_password":
-            logging.info(f"{k} = {'*' * len(v)}")
-        else:
-            logging.info(f"{k} = {v}")
+    statements = [
+        # Create role (will error if exists; we'll catch & continue)
+        sql.SQL("CREATE ROLE {user} WITH LOGIN PASSWORD {pwd}").format(
+            user=user_ident,
+            pwd=pwd_literal,
+        ),
+        sql.SQL("GRANT CONNECT ON DATABASE {db} TO {user}").format(
+            db=db_ident,
+            user=user_ident,
+        ),
+        sql.SQL("GRANT USAGE ON SCHEMA {schema} TO {user}").format(
+            schema=schema_ident,
+            user=user_ident,
+        ),
+        sql.SQL(
+            "REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA {schema} FROM {user}",
+        ).format(schema=schema_ident, user=user_ident),
+        sql.SQL("GRANT SELECT ON {table} TO {user}").format(
+            table=table_ident,
+            user=user_ident,
+        ),
+    ]
 
-    async with conn.cursor() as cur:
-        try:
-            await cur.execute(make_user_sql.format(**user_kwargs))
-        except Exception as e:
-            # Likely role exists; log and continue
-            logging.info(f"User creation skipped or partially applied: {e}")
+    for stmt in statements:
+        async with conn.cursor() as cur:
+            try:
+                await cur.execute(stmt)
+            except Exception as e:
+                # Non-fatal: role may already exist or grant already applied
+                logging.info(f"User privilege statement skipped/partial: {e}")
+                continue
 
 
 async def check_table_length(conn: AsyncConnection) -> bool:
-    """Check if the table is empty"""
+    """Return True if the target table is empty."""
+    table_ident = sql.Identifier(os.environ["POSTGRES_TABLE"])
+    query = sql.SQL("SELECT COUNT(*) FROM {table}").format(table=table_ident)
     async with conn.cursor() as cur:
-        await cur.execute(
-            f"SELECT COUNT(*) FROM {os.environ['POSTGRES_TABLE']}",  # nosec
-        )
+        await cur.execute(query)
         row = await cur.fetchone()
     count = row[0] if row else 0
     logging.info(f"Table has {count} rows")
@@ -361,20 +387,21 @@ def batched(iterable: Iterable, size: int):
         yield batch
 
 
-INSERT_SQL = (
-    "INSERT INTO {table} (id,name,type,description,url,metadata_text,embeddings,geom) "
-    "VALUES (%s,%s,%s,%s,%s,%s,%s::vector,ST_GeomFromWKB(%s,4326))"
+INSERT_SQL_TEMPLATE = sql.SQL(
+    "INSERT INTO {table} (id,name,type,description,url,metadata_text,embeddings,geom) VALUES (%s,%s,%s,%s,%s,%s,%s::vector,ST_GeomFromWKB(%s,4326))",
 )
 
 
 async def load_data(conn: AsyncConnection) -> None:
     """Load data into the database using batched executemany."""
-    sql = INSERT_SQL.format(table=os.environ["POSTGRES_TABLE"])
+    insert_sql = INSERT_SQL_TEMPLATE.format(
+        table=sql.Identifier(os.environ["POSTGRES_TABLE"]),
+    )
     async with conn.transaction():
         async with conn.cursor() as cur:
             total = 0
             for chunk in batched(record_generator(), INIT_LOADER_BATCH_SIZE):
-                await cur.executemany(sql, chunk)
+                await cur.executemany(insert_sql, chunk)  # type: ignore[arg-type]
                 total += len(chunk)
                 logging.info(f"Inserted {total} records ...")
     logging.info("Data load complete")
@@ -389,6 +416,12 @@ async def amain() -> None:
 
     logging.info("Checking / creating table")
     await make_table(conn)
+    # Explicit commit so DDL is persisted immediately (esp. if later logic early-exits)
+    try:
+        await conn.commit()
+        logging.info("Committed table creation DDL")
+    except Exception as e:  # pragma: no cover (defensive)
+        logging.warning(f"Commit after table creation failed (continuing): {e}")
 
     len_zero = await check_table_length(conn)
 
@@ -397,14 +430,42 @@ async def amain() -> None:
         logging.info("Geoparquet path is valid")
 
         logging.info("Loading data")
-        await load_data(conn)
+        await load_data(conn)  # internal transaction handles its own commit
         logging.info("Data loaded")
 
         logging.info("Making spatial index")
         await make_index(conn)
+        # Commit index creation
+        try:
+            await conn.commit()
+            logging.info("Committed spatial index creation")
+        except Exception as e:  # pragma: no cover
+            logging.warning(f"Commit after index creation failed (continuing): {e}")
 
         logging.info("Adding read-only user")
         await make_user(conn)
+        # Commit role & grants so they persist (previously they were lost on close)
+        try:
+            await conn.commit()
+            logging.info("Committed read-only user creation & grants")
+        except Exception as e:  # pragma: no cover
+            logging.warning(f"Commit after user creation failed (continuing): {e}")
+
+    else:
+        logging.info(
+            "Table already had data; skipping load/index but ensuring read-only user exists",
+        )
+        await make_index(conn)  # safe idempotent, ensures index if added later
+        try:
+            await conn.commit()
+        except Exception as e:  # pragma: no cover
+            logging.warning("Commit after ensuring index skipped or failed: %s", e)
+        await make_user(conn)
+        try:
+            await conn.commit()
+            logging.info("Committed (re)creation of read-only user & grants")
+        except Exception as e:  # pragma: no cover
+            logging.warning(f"Commit after user recreation failed (continuing): {e}")
 
     logging.info("All done")
     await conn.close()
