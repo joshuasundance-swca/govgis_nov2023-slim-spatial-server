@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: joshuasundance/postgis_pgvector:1.0.0
