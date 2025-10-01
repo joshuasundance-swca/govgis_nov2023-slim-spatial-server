@@ -3,7 +3,7 @@ import os
 import asyncpg
 from asyncpg.connection import Connection
 from fastapi import FastAPI, Depends
-from langchain.embeddings import HuggingFaceBgeEmbeddings
+from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 
 from models import SemanticSearchRequest, SearchResponse, LayerResult  # type: ignore[attr-defined]
 
