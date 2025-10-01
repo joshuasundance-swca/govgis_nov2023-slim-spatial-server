@@ -15,11 +15,12 @@
 
 🤖 This README was written by GPT-4. 🤖
 
-# UPDATE: added an mcp server with `fastmcp`.
-# UPDATE: moved from python 3.11 to python 3.13
-# TODO: remove asyncpg dependency and use psycopg3
+## UPDATES (09/30/2025)
+- moved from python 3.11 to python 3.13
+- added an mcp server with `fastmcp`
+- [agent.ipynb](./agent.ipynb) shows the use of `deepagents` with the mcp server
+- `TODO`: remove asyncpg dependency and use psycopg3
 
-# UPDATE: [`./agent.ipynb`](./agent.ipynb) shows the use of `deepagents` with the mcp server
 
 ## Introduction
 
