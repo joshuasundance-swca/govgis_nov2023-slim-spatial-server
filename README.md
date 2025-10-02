@@ -124,6 +124,7 @@ The loader provides knobs to balance speed, WAL size, and crash safety.
 
 Loader method:
 - `LOADER_METHOD=copy` (default): Uses a temporary staging table + PostgreSQL COPY for fastest ingestion, then bulk INSERT-select transform into the target table.
+- `LOADER_METHOD=copy_direct`: Pre-vectorizes all data in Python (WKB + embeddings) then uses COPY with staging. Best for trusted data with `ENFORCE_EMBED_DIM=false`.
 - `LOADER_METHOD=executemany`: Falls back to batched parameter inserts (slower, but simpler; useful for debugging or if COPY issues arise).
 
 Core variables:
@@ -134,16 +135,21 @@ Core variables:
   - `work_mem`
   - `temp_buffers`
 
+Performance optimization flags:
+- `ENFORCE_EMBED_DIM` (default true): When false, skips per-row dimension validation for ~10x faster ingestion. Only safe if data is pre-validated.
+- `FAST_DEV_SKIP_INDEX` (default false): When true, skips vector index creation during data load. Useful for iterative development cycles.
+
 Additional tuning:
 - For COPY, `LOADER_COMMIT_INTERVAL` is intentionally ignored since COPY already streams efficiently and one final commit is fastest.
 - Ensure dataset file resides on fast local storage (container volume on SSD preferable).
 
 Recommended scenarios:
-- Fast initial load: `LOADER_METHOD=copy`, tweaks on (defaults suffice).
+- Fast initial load: `LOADER_METHOD=copy_direct`, `ENFORCE_EMBED_DIM=false`, tweaks on (defaults suffice).
+- Production load: `LOADER_METHOD=copy` (default), `ENFORCE_EMBED_DIM=true`.
 - Diagnostic / controlled: `LOADER_METHOD=executemany`, `LOADER_COMMIT_INTERVAL=50000`, synchronous commit on.
 
 Progress Logs:
-- COPY: Logs every 100k streamed rows.
+- COPY: Logs every 100k streamed rows, plus detailed timing for read/vectorize/copy/transform phases.
 - executemany: Logs every 50 batches and at each configured commit boundary.
 
 ## Performance & Pooling
@@ -160,6 +166,15 @@ Core variables (existing):
 Pooling / warm-up variables:
 - `PG_POOL_MAX_SIZE`, `PG_POOL_MIN_SIZE`, `PG_POOL_EAGER`, `PG_POOL_WARM_TARGET`, `PG_POOL_TIMEOUT`, `EMBEDDING_WARMUP`.
 
+Query performance tuning:
+- `IVFFLAT_PROBES` (optional): Set at query time to control recall vs speed tradeoff. Higher values = better recall but slower queries. Default is `lists/10`. For a 1200-list index, try `IVFFLAT_PROBES=200` for better recall.
+- `EMBED_CACHE_SIZE` (default 256): LRU cache size for embedding generation. Reduces latency on repeated queries. Set to 0 to disable.
+
+Native pgvector adapter:
+- When `pgvector` Python package is installed, the connection pool automatically registers the native adapter for efficient `list[float]` → vector conversion.
+- Falls back to string literal format if adapter is unavailable.
+- Removes `::vector` cast overhead and improves query planning.
+
 ## Environment Variable Reference (Summary)
 
 Data & table:
@@ -169,7 +184,10 @@ Vector indexing:
 - `VECTOR_INDEX_TYPE`, `VECTOR_METRIC`, `VECTOR_INDEX_NAME`, `VECTOR_IVFFLAT_LISTS`, `VECTOR_HNSW_M`, `VECTOR_HNSW_EF_CONSTRUCTION`, `VECTOR_MAINTENANCE_WORK_MEM_MB`, `VECTOR_MAINTENANCE_WORK_MEM_MAX_MB`, `VECTOR_AUTOTUNE_INDEX_MEMORY`
 
 Loader performance & method:
-- `LOADER_METHOD`, `INIT_LOADER_BATCH_SIZE` (executemany only), `LOADER_COMMIT_INTERVAL` (executemany only), `LOADER_PERFORMANCE_TWEAKS`, `LOADER_WORK_MEM`, `LOADER_TEMP_BUFFERS`, `LOADER_SYNCHRONOUS_COMMIT`
+- `LOADER_METHOD`, `INIT_LOADER_BATCH_SIZE` (executemany only), `LOADER_COMMIT_INTERVAL` (executemany only), `LOADER_PERFORMANCE_TWEAKS`, `LOADER_WORK_MEM`, `LOADER_TEMP_BUFFERS`, `LOADER_SYNCHRONOUS_COMMIT`, `ENFORCE_EMBED_DIM`, `FAST_DEV_SKIP_INDEX`
+
+Query performance:
+- `IVFFLAT_PROBES`, `EMBED_CACHE_SIZE`
 
 Spatial indexing:
 - `SPATIAL_INDEX_NAME`

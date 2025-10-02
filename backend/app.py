@@ -5,7 +5,6 @@ import logging
 import asyncio
 import time
 
-from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from fastapi import FastAPI, Depends
 
@@ -17,6 +16,16 @@ except ImportError as e:  # pragma: no cover
     ) from e
 import psycopg
 from psycopg import sql
+
+# Try to import pgvector adapter
+try:
+    from pgvector.psycopg import register_vector_async
+
+    PGVECTOR_ADAPTER_AVAILABLE = True
+except ImportError:
+    PGVECTOR_ADAPTER_AVAILABLE = False
+    register_vector_async = None  # type: ignore
+
 from models import SemanticSearchRequest, SearchResponse, LayerResult  # type: ignore[attr-defined]
 
 __version__ = "0.0.1"
@@ -38,6 +47,42 @@ def configure_logging() -> None:
     else:
         logging.getLogger().setLevel(level)
     logger.info("Logging configured level=%s", level_name)
+
+
+async def _configure_connection(conn) -> None:
+    """Configure a connection with pgvector adapter and optional ivfflat.probes.
+
+    Called once per connection to set up:
+    1. pgvector native adapter (if available)
+    2. ivfflat.probes setting (if configured)
+    """
+    # Register pgvector adapter for native list[float] -> vector support
+    if PGVECTOR_ADAPTER_AVAILABLE and register_vector_async:
+        try:
+            await register_vector_async(conn)
+            logger.debug("Registered pgvector adapter on connection")
+        except Exception as e:
+            logger.warning(
+                "Failed to register pgvector adapter (will use string literals): %s",
+                e,
+            )
+    elif not PGVECTOR_ADAPTER_AVAILABLE:
+        logger.debug(
+            "pgvector adapter not available; using string literals for vectors",
+        )
+
+    # Set ivfflat.probes if configured (query-time recall tuning)
+    probes = os.getenv("IVFFLAT_PROBES")
+    if probes and probes.isdigit():
+        try:
+            # Use sync cursor since this is called in a sync context
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("SET ivfflat.probes = {}").format(sql.Literal(int(probes))),
+                )
+            logger.debug("Set ivfflat.probes=%s on connection", probes)
+        except Exception as e:
+            logger.debug("Failed to set ivfflat.probes=%s: %s", probes, e)
 
 
 def _safe_identifier(name: str) -> str:
@@ -198,15 +243,17 @@ async def lifespan(app: FastAPI):  # FastAPI will call this on startup/shutdown
         max_size=max_size,
         timeout=pool_timeout,
         open=False,  # we'll open explicitly (avoid double-open)
+        configure=_configure_connection,  # Configure each connection with pgvector adapter
     )
     await pool.open()
     logger.info(
-        "Pool initialized min=%s max=%s eager=%s timeout=%s warm_target=%s",
+        "Pool initialized min=%s max=%s eager=%s timeout=%s warm_target=%s pgvector_adapter=%s",
         min_size,
         max_size,
         eager,
         pool_timeout,
         warm_target,
+        PGVECTOR_ADAPTER_AVAILABLE,
     )
 
     # Eager mode warms entire pool; otherwise optional partial warm target.
@@ -254,7 +301,8 @@ async def get_connection():
     assert pool is not None, "Connection pool not initialized"  # nosec
     async with pool.connection() as conn:  # connection returned to pool automatically
         elapsed_time = time.time() - start_time
-        logger.info("Connection checkout took %.2f seconds", elapsed_time)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Connection checkout took %.2f seconds", elapsed_time)
         yield conn
 
 
@@ -278,9 +326,10 @@ async def search(
 ) -> SearchResponse:
     start = time.perf_counter()
     query, params = await request.build_query(embedding_model)
-    logger.debug("search start params=%d", len(params))
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("search start params=%d", len(params))
     try:
-        async with conn.cursor(row_factory=dict_row) as cur:
+        async with conn.cursor() as cur:
             await cur.execute(query, params)
             rows = await cur.fetchall()
     except Exception as e:
@@ -299,8 +348,19 @@ async def search(
         len(params),
         duration_ms,
     )
+    # Convert tuple rows to LayerResult (columns: id, name, type, description, url, metadata_text)
     return SearchResponse(
-        layers=[LayerResult.model_validate(dict(r)) for r in rows],
+        layers=[
+            LayerResult(
+                id=row[0],
+                name=row[1],
+                type=row[2],
+                description=row[3],
+                url=row[4],
+                metadata_text=row[5],
+            )
+            for row in rows
+        ],
         error=None,
     )
 

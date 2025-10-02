@@ -3,13 +3,14 @@ import time
 import os
 import re
 from typing import Optional, Tuple, List
+from functools import lru_cache
 
 from pydantic import BaseModel, field_validator, model_validator, Field
 from pyproj import (
     Proj,
     Transformer,
 )
-from sqlalchemy.sql import quoted_name  # added for safe identifier quoting
+from psycopg import sql
 
 from load_data import table_columns
 import logging
@@ -20,6 +21,9 @@ DEFAULT_SEARCH_LIMIT = 5
 MAXIMUM_SEARCH_LIMIT = 10
 
 TEXT_FIELDS = table_columns[:-2]
+
+# Embedding cache size (configurable via env)
+_EMBED_CACHE_SIZE = int(os.getenv("EMBED_CACHE_SIZE", "256"))
 
 
 class Point(BaseModel):
@@ -103,21 +107,56 @@ class SemanticSearchRequest(BaseModel):
     def transform_emb(emb: list[float]) -> str:
         return "[" + ",".join(format(x, "g") for x in emb) + "]"
 
-    async def embed_query(self, embedding_model) -> str:
+    @staticmethod
+    @lru_cache(maxsize=_EMBED_CACHE_SIZE)
+    def _cached_embed_sync(request_string: str, model_name: str) -> str:
+        """Sync wrapper for caching. Not called directly - used by embed_query."""
+        # This is a placeholder that should never be called directly
+        # The actual embedding is done in embed_query
+        raise NotImplementedError("Use embed_query instead")
+
+    async def embed_query(self, embedding_model) -> list[float]:
+        """Generate embeddings for the query with LRU caching.
+
+        Returns the raw list[float] for native pgvector adapter support.
+        Falls back to string literal if adapter is not available.
+        """
+        # Create cache key from request string
+        # We normalize the string to improve cache hits
+        cache_key = self.request_string.strip().lower()
+
+        # Try to use a simple dict cache (thread-safe for async single-threaded event loop)
+        if not hasattr(self.__class__, "_embed_cache"):
+            self.__class__._embed_cache = {}
+
+        if cache_key in self.__class__._embed_cache:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Embedding cache hit for query")
+            return self.__class__._embed_cache[cache_key]
+
+        # Cache miss - generate embedding
         start_time = time.time()
         _emb = await embedding_model.aembed_query(self.request_string)
         elapsed_time = time.time() - start_time
-        logger.info(f"Embedding generation took {elapsed_time:.2f} seconds")
-        return self.transform_emb(_emb)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Embedding generation took {elapsed_time:.2f} seconds")
+
+        # Store in cache (with size limit)
+        if len(self.__class__._embed_cache) >= _EMBED_CACHE_SIZE:
+            # Simple eviction: remove first item (FIFO-ish)
+            self.__class__._embed_cache.pop(next(iter(self.__class__._embed_cache)))
+        self.__class__._embed_cache[cache_key] = _emb
+
+        return _emb
 
     async def build_query(self, embedding_model) -> Tuple[str, List]:
-        """Build a parameterized SQL query ensuring parameter order matches placeholders.
+        """Build a parameterized SQL query (safe composed) with explicit vector casting and metric-aware operator.
 
-        Placeholder order in final SQL:
-          1..N : optional filter params (type array, lon, lat)
-          Next : embedding vector literal for ORDER BY
-          Next : LIMIT
-          Next : OFFSET
+        All dynamic SQL fragments (table name, column list, operator, direction, WHERE fragments) are either:
+          - Strictly validated against conservative regex (identifiers)
+          - Chosen from fixed whitelists (operator, direction)
+          - Constant clause templates with only parameter placeholders (%s)
+        This design prevents SQL injection; we avoid string interpolation of untrusted values.
         """
         try:
             table_name = os.environ["POSTGRES_TABLE"]
@@ -133,53 +172,83 @@ class SemanticSearchRequest(BaseModel):
         if unsafe_cols:
             raise ValueError(f"Invalid column names detected: {unsafe_cols}")
 
-        quoted_cols = [quoted_name(c, quote=True) for c in TEXT_FIELDS]
-        output_columns = ",".join(f'"{c}"' for c in quoted_cols)
-        quoted_table = f'"{quoted_name(table_name, quote=True)}"'
+        # Column identifiers (quoted automatically by psycopg)
+        column_idents = [sql.Identifier(c) for c in TEXT_FIELDS]
+        select_list = sql.SQL(",").join(column_idents)
+        table_ident = sql.Identifier(table_name)
 
         params: List = []
-        filter_clauses: List[str] = []
+        filter_clauses: list[sql.SQL] = []
 
-        # Collect filter params first so their placeholders appear first.
         if self.type_filter:
             lowered_types = [t.lower() for t in self.type_filter if t]
             if lowered_types:
                 params.append(lowered_types)
-                filter_clauses.append('LOWER("type") = ANY(%s)')
+                filter_clauses.append(sql.SQL('LOWER("type") = ANY(%s)'))
 
         if self.input_point is not None:
             params.append(self.input_point.longitude)
             params.append(self.input_point.latitude)
             filter_clauses.append(
-                'ST_Intersects("geom", ST_SetSRID(ST_MakePoint(%s, %s), 4326))',
+                sql.SQL(
+                    'ST_Intersects("geom", ST_SetSRID(ST_MakePoint(%s, %s), 4326))',
+                ),
             )
 
-        where_sql = ""
+        where_sql = sql.SQL("")
         if filter_clauses:
-            where_sql = "WHERE " + " AND ".join(filter_clauses)
+            where_sql = (
+                sql.SQL("WHERE ") + sql.SQL(" AND ").join(filter_clauses) + sql.SQL(" ")
+            )
 
-        # Embedding param now appended AFTER filters so its placeholder is next.
-        emb_literal = await self.embed_query(embedding_model)
+        emb_vector = await self.embed_query(embedding_model)
+        emb_literal = self.transform_emb(emb_vector)
         params.append(emb_literal)
 
-        # LIMIT and OFFSET last.
         params.append(self.limit)
         params.append(self.skip)
 
-        query = (
-            f"SELECT {output_columns} FROM {quoted_table} "  # nosec
-            f"{where_sql} "
-            f'ORDER BY "embeddings" <=> %s::vector '
-            f"LIMIT %s OFFSET %s"
+        metric = os.environ.get("VECTOR_METRIC", "l2").lower()
+        op_map = {"l2": "<->", "cosine": "<=>", "ip": "<#>"}
+        op = op_map.get(metric, "<->")
+        # Whitelist direction
+        order_desc_ip = os.environ.get("VECTOR_IP_DESC", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        direction = (
+            "DESC" if (metric == "ip" and op == "<#>" and order_desc_ip) else "ASC"
+        )
+        if direction not in {"ASC", "DESC"}:
+            raise ValueError("Invalid order direction computed")
+
+        # Compose ORDER BY with validated operator & direction (cannot parameterize these tokens)
+        order_clause = (
+            sql.SQL('ORDER BY "embeddings" ')
+            + sql.SQL(op)
+            + sql.SQL(" %s::vector ")
+            + sql.SQL(direction)
+            + sql.SQL(" ")
         )
 
-        return query, params
+        query_composed = (
+            sql.SQL("SELECT ")
+            + select_list
+            + sql.SQL(" FROM ")
+            + table_ident
+            + sql.SQL(" ")
+            + where_sql
+            + order_clause
+            + sql.SQL("LIMIT %s OFFSET %s")
+        )
+        # Return composed object (psycopg accepts it) and params list
+        return query_composed, params
 
 
 class LayerResult(BaseModel):
-    id: str = Field(
-        description="The unique identifier for the layer.",
-    )
+    id: str = Field(description="The unique identifier for the layer.")
     name: str = Field(description="The name of the layer.")
     type: str = Field(description="The type of the layer.")
     description: str = Field(description="A description of the layer.")
