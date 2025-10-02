@@ -253,10 +253,11 @@ async def make_vector_index(conn: AsyncConnection) -> None:
         # Set initial maintenance_work_mem for index build (best-effort)
         if index_type == "ivfflat":
             try:
+                # Correct syntax: value with unit must be provided as a *string* or with a space, e.g. '512MB' or '512 MB'.
+                # Using a parameter prevents injection and avoids parsing errors like previously seen with "512MB" literal.
                 await cur.execute(
-                    sql.SQL("SET maintenance_work_mem TO {}MB").format(
-                        sql.SQL(str(base_mem_mb)),
-                    ),
+                    "SET maintenance_work_mem TO %s",
+                    (f"{base_mem_mb}MB",),
                 )
                 logging.info(
                     "Set maintenance_work_mem to %sMB for vector index build",
@@ -268,6 +269,11 @@ async def make_vector_index(conn: AsyncConnection) -> None:
                     base_mem_mb,
                     e,
                 )
+                # Important: an error leaves the transaction aborted; rollback so subsequent DDL can proceed.
+                try:
+                    await conn.rollback()
+                except Exception:  # pragma: no cover  # nosec
+                    pass
 
         def build_stmt(lists_val: int | None = None):
             if index_type == "ivfflat":
@@ -341,9 +347,8 @@ async def make_vector_index(conn: AsyncConnection) -> None:
                         if not tried_raise_mem and required_mb <= max_mem_mb:
                             try:
                                 await cur.execute(
-                                    sql.SQL("SET maintenance_work_mem TO {}MB").format(
-                                        sql.SQL(str(required_mb)),
-                                    ),
+                                    "SET maintenance_work_mem TO %s",
+                                    (f"{required_mb}MB",),
                                 )
                                 tried_raise_mem = True
                                 logging.info(
@@ -358,6 +363,10 @@ async def make_vector_index(conn: AsyncConnection) -> None:
                                     required_mb,
                                     se,
                                 )
+                                try:
+                                    await conn.rollback()
+                                except Exception:  # pragma: no cover  # nosec
+                                    pass
                         # If cannot raise memory, attempt to reduce lists heuristically
                         if current_lists and current_lists > 50:
                             new_lists = max(50, int(current_lists * 0.75))
