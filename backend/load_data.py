@@ -275,8 +275,10 @@ async def make_vector_index(conn: AsyncConnection) -> None:
         # Initial maintenance_work_mem attempt (BEST EFFORT). Parameterized so server sees '512MB'.
         if index_type == "ivfflat":
             try:
-                # Use a safely constructed literal; value sourced from validated int env var.
-                await cur.execute(f"SET maintenance_work_mem TO '{base_mem_mb}MB'")
+                await cur.execute(
+                    "SET maintenance_work_mem TO %s",
+                    (f"{base_mem_mb}MB",),
+                )
                 logging.info(
                     "Set maintenance_work_mem to %sMB for vector index build",
                     base_mem_mb,
@@ -362,7 +364,8 @@ async def make_vector_index(conn: AsyncConnection) -> None:
                         if not tried_raise_mem and required_mb <= max_mem_mb:
                             try:
                                 await cur.execute(
-                                    f"SET maintenance_work_mem TO '{required_mb}MB'",
+                                    "SET maintenance_work_mem TO %s",
+                                    (f"{required_mb}MB",),
                                 )
                                 tried_raise_mem = True
                                 logging.info(
@@ -377,7 +380,7 @@ async def make_vector_index(conn: AsyncConnection) -> None:
                                     required_mb,
                                     se,
                                 )
-                                try:  # clear aborted transaction before any downgrade attempt
+                                try:
                                     await conn.rollback()
                                 except Exception:  # pragma: no cover  # nosec
                                     pass
