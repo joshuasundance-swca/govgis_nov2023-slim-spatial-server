@@ -4,7 +4,6 @@ import re
 import logging
 import asyncio
 import time
-from functools import lru_cache
 
 from psycopg_pool import AsyncConnectionPool
 from fastapi import FastAPI, Depends
@@ -20,11 +19,12 @@ from psycopg import sql
 
 # Try to import pgvector adapter
 try:
-    from pgvector.psycopg import register_vector
+    from pgvector.psycopg import register_vector_async
+
     PGVECTOR_ADAPTER_AVAILABLE = True
 except ImportError:
     PGVECTOR_ADAPTER_AVAILABLE = False
-    register_vector = None  # type: ignore
+    register_vector_async = None  # type: ignore
 
 from models import SemanticSearchRequest, SearchResponse, LayerResult  # type: ignore[attr-defined]
 
@@ -49,30 +49,37 @@ def configure_logging() -> None:
     logger.info("Logging configured level=%s", level_name)
 
 
-def _configure_connection(conn) -> None:
+async def _configure_connection(conn) -> None:
     """Configure a connection with pgvector adapter and optional ivfflat.probes.
-    
+
     Called once per connection to set up:
     1. pgvector native adapter (if available)
     2. ivfflat.probes setting (if configured)
     """
     # Register pgvector adapter for native list[float] -> vector support
-    if PGVECTOR_ADAPTER_AVAILABLE and register_vector:
+    if PGVECTOR_ADAPTER_AVAILABLE and register_vector_async:
         try:
-            register_vector(conn)
+            await register_vector_async(conn)
             logger.debug("Registered pgvector adapter on connection")
         except Exception as e:
-            logger.warning("Failed to register pgvector adapter (will use string literals): %s", e)
+            logger.warning(
+                "Failed to register pgvector adapter (will use string literals): %s",
+                e,
+            )
     elif not PGVECTOR_ADAPTER_AVAILABLE:
-        logger.debug("pgvector adapter not available; using string literals for vectors")
-    
+        logger.debug(
+            "pgvector adapter not available; using string literals for vectors",
+        )
+
     # Set ivfflat.probes if configured (query-time recall tuning)
     probes = os.getenv("IVFFLAT_PROBES")
     if probes and probes.isdigit():
         try:
             # Use sync cursor since this is called in a sync context
             with conn.cursor() as cur:
-                cur.execute(sql.SQL("SET ivfflat.probes = {}").format(sql.Literal(int(probes))))
+                cur.execute(
+                    sql.SQL("SET ivfflat.probes = {}").format(sql.Literal(int(probes))),
+                )
             logger.debug("Set ivfflat.probes=%s on connection", probes)
         except Exception as e:
             logger.debug("Failed to set ivfflat.probes=%s: %s", probes, e)
