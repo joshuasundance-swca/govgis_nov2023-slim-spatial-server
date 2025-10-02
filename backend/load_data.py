@@ -81,6 +81,9 @@ def check_env_vars() -> None:
         "VECTOR_MAINTENANCE_WORK_MEM_MAX_MB": "2048",
         # Enable automatic retry if memory error indicates higher requirement
         "VECTOR_AUTOTUNE_INDEX_MEMORY": "true",
+        # Performance optimization flags
+        "ENFORCE_EMBED_DIM": "true",
+        "FAST_DEV_SKIP_INDEX": "false",
     }
 
     for env_var in required_env_vars:
@@ -136,8 +139,8 @@ def check_env_vars() -> None:
         raise ValueError("LOADER_COMMIT_INTERVAL must be >= 0 integer")
 
     loader_method = os.environ.get("LOADER_METHOD", "copy").lower()
-    if loader_method not in {"copy", "executemany"}:
-        raise ValueError("LOADER_METHOD must be 'copy' or 'executemany'")
+    if loader_method not in {"copy", "copy_direct", "executemany"}:
+        raise ValueError("LOADER_METHOD must be 'copy', 'copy_direct', or 'executemany'")
     os.environ["LOADER_METHOD"] = loader_method
 
     # maintenance work mem numbers
@@ -156,6 +159,17 @@ def check_env_vars() -> None:
     if auto_tune not in {"true", "false"}:
         raise ValueError("VECTOR_AUTOTUNE_INDEX_MEMORY must be true or false")
     os.environ["VECTOR_AUTOTUNE_INDEX_MEMORY"] = auto_tune
+
+    # Validate new performance flags
+    enforce_dim = os.environ.get("ENFORCE_EMBED_DIM", "true").lower()
+    if enforce_dim not in {"true", "false"}:
+        raise ValueError("ENFORCE_EMBED_DIM must be true or false")
+    os.environ["ENFORCE_EMBED_DIM"] = enforce_dim
+
+    skip_index = os.environ.get("FAST_DEV_SKIP_INDEX", "false").lower()
+    if skip_index not in {"true", "false"}:
+        raise ValueError("FAST_DEV_SKIP_INDEX must be true or false")
+    os.environ["FAST_DEV_SKIP_INDEX"] = skip_index
 
 
 def check_geoparquet_path() -> None:
@@ -556,6 +570,7 @@ def record_generator() -> (
     skipped = 0
     dim_mismatch = 0
     first_type_logged = False
+    enforce_dim = os.environ.get("ENFORCE_EMBED_DIM", "true").lower() == "true"
     expected_dim = int(os.environ.get("PGVECTOR_DIM", "1024"))
     for row in gdf.itertuples(index=False):
         (id_, name, type_, description, url, metadata_text, embeddings, geom) = row
@@ -574,8 +589,8 @@ def record_generator() -> (
                     type(embeddings),
                 )
             continue
-        # Dimension enforcement
-        if emb_lit is not None:
+        # Dimension enforcement (can be disabled for performance)
+        if enforce_dim and emb_lit is not None:
             # count commas + 1 is dimension (fast, avoids splitting large lists fully)
             dim = emb_lit.count(",") + 1
             if dim != expected_dim:
@@ -611,6 +626,76 @@ def record_generator() -> (
         )
 
 
+def prepare_dataframe():
+    """Prepare the entire dataframe with vectorized operations for fast loading.
+    
+    Returns:
+        tuple: (gdf, emb_literals_list, geom_wkb_list) where:
+            - gdf: GeoDataFrame with all columns
+            - emb_literals_list: list of embedding string literals
+            - geom_wkb_list: list of WKB bytes for geometries
+    """
+    import time
+    start_time = time.time()
+    
+    # Read data
+    required_cols = [c for c in table_columns if c != "geom"] + ["geometry"]
+    gdf = (
+        gpd.read_parquet(os.environ["GEOPARQUET_PATH"], columns=required_cols)
+        .drop_duplicates(subset=["id", "metadata_text"])
+        .rename(columns={"geometry": "geom"})
+    )
+    gdf = gdf[[c for c in table_columns]]
+    read_time = time.time() - start_time
+    logging.info(f"Read {len(gdf)} rows in {read_time:.2f}s")
+    
+    # Vectorize WKB conversion
+    vec_start = time.time()
+    geom_wkb_list = [shapely.wkb.dumps(g, hex=False) for g in gdf["geom"]]
+    wkb_time = time.time() - vec_start
+    logging.info(f"Vectorized WKB conversion in {wkb_time:.2f}s")
+    
+    # Vectorize embedding literal conversion
+    emb_start = time.time()
+    enforce_dim = os.environ.get("ENFORCE_EMBED_DIM", "true").lower() == "true"
+    expected_dim = int(os.environ.get("PGVECTOR_DIM", "1024"))
+    
+    emb_literals_list = []
+    skipped = 0
+    dim_mismatch = 0
+    
+    for i, emb_val in enumerate(gdf["embeddings"]):
+        try:
+            emb_lit = vector_literal(emb_val)
+            
+            # Dimension check (if enabled)
+            if enforce_dim and emb_lit is not None:
+                dim = emb_lit.count(",") + 1
+                if dim != expected_dim:
+                    dim_mismatch += 1
+                    if dim_mismatch <= 10:
+                        logging.warning(
+                            f"Skipping row idx={i}: embedding dim {dim} != expected {expected_dim}",
+                        )
+                    emb_literals_list.append(None)
+                    continue
+            
+            emb_literals_list.append(emb_lit)
+        except Exception as e:
+            skipped += 1
+            if skipped <= 10:
+                logging.warning(f"Embedding conversion error at idx={i}: {e}")
+            emb_literals_list.append(None)
+    
+    emb_time = time.time() - emb_start
+    logging.info(f"Vectorized embedding literals in {emb_time:.2f}s (skipped={skipped}, dim_mismatch={dim_mismatch})")
+    
+    total_time = time.time() - start_time
+    logging.info(f"Total dataframe preparation: {total_time:.2f}s")
+    
+    return gdf, emb_literals_list, geom_wkb_list
+
+
 def batched(iterable: Iterable, size: int):
     batch = []
     for item in iterable:
@@ -628,7 +713,7 @@ INSERT_SQL_TEMPLATE = sql.SQL(
 
 
 async def load_data(conn: AsyncConnection) -> None:
-    """Load data using COPY (default) or batched executemany (fallback).
+    """Load data using COPY (default), copy_direct (fastest), or batched executemany (fallback).
 
     COPY path:
       1. Create a temporary staging table with embeddings TEXT and geom_wkb BYTEA.
@@ -636,13 +721,29 @@ async def load_data(conn: AsyncConnection) -> None:
       3. Insert-transform into target table casting embeddings::vector and ST_GeomFromWKB.
       4. Single final commit.
 
+    COPY_DIRECT path (fastest):
+      1. Pre-read and vectorize entire dataset (WKB + embedding literals).
+      2. COPY directly to target table (no staging).
+      3. Single final commit.
+
     Executemany fallback retains prior behavior (honors LOADER_COMMIT_INTERVAL).
     """
+    import time
+    total_start = time.time()
+    
     method = os.environ.get("LOADER_METHOD", "copy")
     if method == "executemany":
         logging.info("LOADER_METHOD=executemany selected (legacy path)")
         await _load_data_executemany(conn)
         return
+    
+    if method == "copy_direct":
+        logging.info("LOADER_METHOD=copy_direct selected (direct bulk load, no staging)")
+        await _load_data_copy_direct(conn)
+        total_time = time.time() - total_start
+        logging.info(f"Total load_data time: {total_time:.2f}s")
+        return
+    
     logging.info("LOADER_METHOD=copy selected (bulk COPY path)")
 
     # Session tweaks (still valuable for COPY)
@@ -688,6 +789,7 @@ async def load_data(conn: AsyncConnection) -> None:
         # 2. COPY stream
         copy_stmt = "COPY temp_layers_stage (id,name,type,description,url,metadata_text,embeddings,geom_wkb) FROM STDIN"
         total = 0
+        copy_start = time.time()
         async with cur.copy(copy_stmt) as copy:
             for rec in record_generator():
                 (
@@ -717,9 +819,11 @@ async def load_data(conn: AsyncConnection) -> None:
                 total += 1
                 if total % 100000 == 0:
                     logging.info("COPY streamed %d rows...", total)
-        logging.info("Finished COPY streaming %d rows", total)
+        copy_time = time.time() - copy_start
+        logging.info(f"Finished COPY streaming {total} rows in {copy_time:.2f}s")
 
         # 3. Insert-transform
+        transform_start = time.time()
         target_table = sql.Identifier(os.environ["POSTGRES_TABLE"])
         insert_transform = sql.SQL(
             """
@@ -731,11 +835,130 @@ async def load_data(conn: AsyncConnection) -> None:
             """,
         ).format(target=target_table)
         await cur.execute(insert_transform)
-        logging.info("Inserted %d rows from staging into target table", total)
+        transform_time = time.time() - transform_start
+        logging.info(f"Inserted {total} rows from staging into target table in {transform_time:.2f}s")
         await conn.commit()
         logging.info("Committed COPY load")
 
-    logging.info("Data load complete (COPY path)")
+    total_time = time.time() - total_start
+    logging.info(f"Data load complete (COPY path) - total time: {total_time:.2f}s")
+
+
+async def _load_data_copy_direct(conn: AsyncConnection) -> None:
+    """Fast direct COPY to target table using pre-vectorized data.
+    
+    This is the fastest loading method as it:
+    1. Pre-reads entire dataset and vectorizes WKB/embeddings in Python
+    2. Uses a staging approach but with all data pre-processed
+    3. Single transform insert to target
+    
+    Best for: Known-good data where dimension checking overhead is unnecessary.
+    """
+    import time
+    
+    # Prepare all data upfront with vectorization
+    prep_start = time.time()
+    gdf, emb_literals_list, geom_wkb_list = prepare_dataframe()
+    prep_time = time.time() - prep_start
+    logging.info(f"Dataframe preparation complete in {prep_time:.2f}s")
+    
+    # Apply session tweaks
+    tweaks = os.environ.get("LOADER_PERFORMANCE_TWEAKS", "true").lower() == "true"
+    async with conn.cursor() as cur:
+        if tweaks:
+            settings = {
+                "synchronous_commit": os.environ.get(
+                    "LOADER_SYNCHRONOUS_COMMIT",
+                    "off",
+                ),
+                "work_mem": os.environ.get("LOADER_WORK_MEM", "128MB"),
+                "temp_buffers": os.environ.get("LOADER_TEMP_BUFFERS", "32MB"),
+            }
+            for k, v in settings.items():
+                try:
+                    await cur.execute(
+                        sql.SQL("SET {} TO {}").format(  # type: ignore[arg-type]
+                            sql.SQL(k),
+                            sql.Literal(v),
+                        ),
+                    )
+                except Exception as e:  # pragma: no cover
+                    logging.info(f"Skipping load tweak {k}={v}: {e}")
+        
+        # Create temp staging table
+        await cur.execute(
+            """
+            CREATE TEMP TABLE temp_layers_stage (
+                id text,
+                name text,
+                type text,
+                description text,
+                url text,
+                metadata_text text,
+                embeddings text,
+                geom_wkb bytea
+            ) ON COMMIT DROP
+            """,
+        )
+        
+        # COPY to staging with pre-vectorized data
+        copy_stmt = "COPY temp_layers_stage (id,name,type,description,url,metadata_text,embeddings,geom_wkb) FROM STDIN"
+        
+        copy_start = time.time()
+        total = 0
+        skipped = 0
+        
+        async with cur.copy(copy_stmt) as copy:
+            for i, row in enumerate(gdf.itertuples(index=False)):
+                emb_lit = emb_literals_list[i]
+                geom_wkb = geom_wkb_list[i]
+                
+                # Skip rows with invalid embeddings (already logged during prep)
+                if emb_lit is None:
+                    skipped += 1
+                    continue
+                
+                (id_, name, type_, description, url, metadata_text, _, _) = row
+                
+                await copy.write_row(
+                    [
+                        id_,
+                        name,
+                        type_,
+                        description,
+                        url,
+                        metadata_text,
+                        emb_lit,
+                        psycopg.Binary(geom_wkb),
+                    ],
+                )
+                total += 1
+                if total % 100000 == 0:
+                    logging.info(f"COPY direct streamed {total} rows...")
+        
+        copy_time = time.time() - copy_start
+        logging.info(f"Finished COPY to staging {total} rows (skipped={skipped}) in {copy_time:.2f}s")
+        
+        # Transform and insert to target
+        transform_start = time.time()
+        target_table = sql.Identifier(os.environ["POSTGRES_TABLE"])
+        insert_transform = sql.SQL(
+            """
+            INSERT INTO {target} (id,name,type,description,url,metadata_text,embeddings,geom)
+            SELECT id,name,type,description,url,metadata_text,
+                   CASE WHEN embeddings IS NULL THEN NULL ELSE embeddings::vector END,
+                   ST_SetSRID(ST_GeomFromWKB(geom_wkb),4326)
+            FROM temp_layers_stage
+            """,
+        ).format(target=target_table)
+        await cur.execute(insert_transform)
+        transform_time = time.time() - transform_start
+        logging.info(f"Transformed and inserted {total} rows in {transform_time:.2f}s")
+        
+        await conn.commit()
+        logging.info("Committed direct COPY load")
+    
+    logging.info("Data load complete (copy_direct path)")
 
 
 # Legacy executemany path retained for fallback / comparison
@@ -830,16 +1053,21 @@ async def amain() -> None:
         await load_data(conn)  # internal transaction handles its own commit
         logging.info("Data loaded")
 
-        logging.info("Making spatial index")
-        await make_index(conn)
-        logging.info("Making vector index")
-        await make_vector_index(conn)
-        # Commit index creation
-        try:
-            await conn.commit()
-            logging.info("Committed spatial & vector index creation")
-        except Exception as e:  # pragma: no cover
-            logging.warning(f"Commit after index creation failed (continuing): {e}")
+        skip_index = os.environ.get("FAST_DEV_SKIP_INDEX", "false").lower() == "true"
+        
+        if skip_index:
+            logging.info("FAST_DEV_SKIP_INDEX=true, skipping index creation")
+        else:
+            logging.info("Making spatial index")
+            await make_index(conn)
+            logging.info("Making vector index")
+            await make_vector_index(conn)
+            # Commit index creation
+            try:
+                await conn.commit()
+                logging.info("Committed spatial & vector index creation")
+            except Exception as e:  # pragma: no cover
+                logging.warning(f"Commit after index creation failed (continuing): {e}")
 
         logging.info("Adding read-only user")
         await make_user(conn)

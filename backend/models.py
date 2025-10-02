@@ -3,6 +3,7 @@ import time
 import os
 import re
 from typing import Optional, Tuple, List
+from functools import lru_cache
 
 from pydantic import BaseModel, field_validator, model_validator, Field
 from pyproj import (
@@ -20,6 +21,9 @@ DEFAULT_SEARCH_LIMIT = 5
 MAXIMUM_SEARCH_LIMIT = 10
 
 TEXT_FIELDS = table_columns[:-2]
+
+# Embedding cache size (configurable via env)
+_EMBED_CACHE_SIZE = int(os.getenv("EMBED_CACHE_SIZE", "256"))
 
 
 class Point(BaseModel):
@@ -103,19 +107,54 @@ class SemanticSearchRequest(BaseModel):
     def transform_emb(emb: list[float]) -> str:
         return "[" + ",".join(format(x, "g") for x in emb) + "]"
 
-    async def embed_query(self, embedding_model) -> str:
+    @staticmethod
+    @lru_cache(maxsize=_EMBED_CACHE_SIZE)
+    def _cached_embed_sync(request_string: str, model_name: str) -> str:
+        """Sync wrapper for caching. Not called directly - used by embed_query."""
+        # This is a placeholder that should never be called directly
+        # The actual embedding is done in embed_query
+        raise NotImplementedError("Use embed_query instead")
+
+    async def embed_query(self, embedding_model) -> list[float]:
+        """Generate embeddings for the query with LRU caching.
+        
+        Returns the raw list[float] for native pgvector adapter support.
+        Falls back to string literal if adapter is not available.
+        """
+        # Create cache key from request string
+        # We normalize the string to improve cache hits
+        cache_key = self.request_string.strip().lower()
+        
+        # Try to use a simple dict cache (thread-safe for async single-threaded event loop)
+        if not hasattr(self.__class__, '_embed_cache'):
+            self.__class__._embed_cache = {}
+        
+        if cache_key in self.__class__._embed_cache:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Embedding cache hit for query")
+            return self.__class__._embed_cache[cache_key]
+        
+        # Cache miss - generate embedding
         start_time = time.time()
         _emb = await embedding_model.aembed_query(self.request_string)
         elapsed_time = time.time() - start_time
-        logger.info(f"Embedding generation took {elapsed_time:.2f} seconds")
-        return self.transform_emb(_emb)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Embedding generation took {elapsed_time:.2f} seconds")
+        
+        # Store in cache (with size limit)
+        if len(self.__class__._embed_cache) >= _EMBED_CACHE_SIZE:
+            # Simple eviction: remove first item (FIFO-ish)
+            self.__class__._embed_cache.pop(next(iter(self.__class__._embed_cache)))
+        self.__class__._embed_cache[cache_key] = _emb
+        
+        return _emb
 
     async def build_query(self, embedding_model) -> Tuple[str, List]:
         """Build a parameterized SQL query ensuring parameter order matches placeholders.
 
         Placeholder order in final SQL:
           1..N : optional filter params (type array, lon, lat)
-          Next : embedding vector literal for ORDER BY
+          Next : embedding vector (as list[float] for native adapter, or string for fallback)
           Next : LIMIT
           Next : OFFSET
         """
@@ -158,18 +197,30 @@ class SemanticSearchRequest(BaseModel):
         if filter_clauses:
             where_sql = "WHERE " + " AND ".join(filter_clauses)
 
-        # Embedding param now appended AFTER filters so its placeholder is next.
-        emb_literal = await self.embed_query(embedding_model)
-        params.append(emb_literal)
+        # Get embedding as list[float] for native pgvector adapter
+        emb_vector = await self.embed_query(embedding_model)
+        
+        # Check if pgvector adapter is available (imported in app.py)
+        # If available, pass as list[float]; otherwise convert to string literal
+        try:
+            from app import PGVECTOR_ADAPTER_AVAILABLE
+            if PGVECTOR_ADAPTER_AVAILABLE:
+                params.append(emb_vector)  # Native list[float]
+            else:
+                params.append(self.transform_emb(emb_vector))  # String literal fallback
+        except ImportError:
+            # Fallback if we can't import from app (e.g., in tests)
+            params.append(self.transform_emb(emb_vector))
 
         # LIMIT and OFFSET last.
         params.append(self.limit)
         params.append(self.skip)
 
+        # Build query without ::vector cast (adapter handles conversion)
         query = (
             f"SELECT {output_columns} FROM {quoted_table} "  # nosec
             f"{where_sql} "
-            f'ORDER BY "embeddings" <=> %s::vector '
+            f'ORDER BY "embeddings" <=> %s '
             f"LIMIT %s OFFSET %s"
         )
 
