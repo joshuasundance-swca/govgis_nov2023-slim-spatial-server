@@ -8,7 +8,7 @@ langchain-community==0.3.30
 pgvector==0.4.1
 psycopg2-binary==2.9.10
 pyarrow==21.0.0
-pydantic==2.11.9
+pydantic==2.11.10
 pyproj==3.7.2
 PyYAML==6.0.3
 sentence-transformers==5.1.1
