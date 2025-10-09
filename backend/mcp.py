@@ -22,7 +22,7 @@ def markdownify_all_strings(obj):
 
 @mcp.tool
 async def gis_layer_search(request: SemanticSearchRequest) -> SearchResponse:
-    response = await client.post("/search", json=request.model_dump())
+    response = await client.post("/search", json=request.model_dump(), timeout=60.0)
     response.raise_for_status()
     response_dict = response.json()
     response_dict_md = markdownify_all_strings(response_dict)
