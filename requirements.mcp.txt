@@ -1,2 +1,2 @@
-fastmcp==2.12.4
-markdownify==1.2.0
+fastmcp==2.13.1
+markdownify==1.2.2
