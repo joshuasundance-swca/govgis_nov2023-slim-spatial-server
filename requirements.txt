@@ -1,18 +1,18 @@
-asyncpg==0.30.0
-fastapi==0.118.0
-GeoAlchemy2==0.18.0
-geopandas==1.1.1
-gunicorn==23.0.0
-langchain==0.3.27
-langchain-community==0.3.30
-pgvector==0.4.1
-psycopg2-binary==2.9.10
-pyarrow==21.0.0
-pydantic==2.11.9
+asyncpg==0.31.0
+fastapi==0.128.0
+GeoAlchemy2==0.18.1
+geopandas==1.1.2
+gunicorn==24.1.1
+langchain==1.2.7
+langchain-community==0.4.1
+pgvector==0.4.2
+psycopg2-binary==2.9.11
+pyarrow==23.0.0
+pydantic==2.12.5
 pyproj==3.7.2
 PyYAML==6.0.3
-sentence-transformers==5.1.1
+sentence-transformers==5.2.0
 shapely==2.1.2
-SQLAlchemy==2.0.43
-torch==2.8.0 -f https://download.pytorch.org/whl/cpu/torch_stable.html
-uvicorn==0.37.0
+SQLAlchemy==2.0.46
+torch==2.10.0 -f https://download.pytorch.org/whl/cpu/torch_stable.html
+uvicorn==0.40.0
