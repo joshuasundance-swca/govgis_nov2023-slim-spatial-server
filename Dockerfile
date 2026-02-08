@@ -1,4 +1,4 @@
-FROM python:3.13.7-slim-trixie AS base
+FROM python:3.14.3-slim-trixie AS base
 
 RUN adduser --uid 1000 --disabled-password --gecos '' appuser
 USER 1000
